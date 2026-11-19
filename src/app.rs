@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 
+use crate::alert::{Alert, AlertEngine, ClockInput};
 use crate::benchmark::{self, BenchmarkResult};
+use crate::clock;
 use crate::collect::CollectorResult;
 use crate::history::HistoryStore;
+use crate::notify;
 
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
@@ -24,6 +27,17 @@ pub struct App {
     history_path: Option<PathBuf>,
     pub last_error: Option<String>,
     pub frames_rendered: u64,
+    /// Pure alert state machine; advanced once per incoming sample (1 Hz).
+    alert_engine: AlertEngine,
+    /// Master mute for every nudge (tray menu / header toggle).
+    pub alerts_paused: bool,
+    /// Most recent alert, for the dashboard banner.
+    pub last_alert: Option<Alert>,
+    /// True while the window is shown. While hidden (menu-bar agent mode),
+    /// no egui frame is drawn and repaints fall back to the 1 Hz sample tick.
+    pub window_visible: bool,
+    /// Monotonic origin for the engine's injected clock.
+    start: std::time::Instant,
 }
 
 /// Fixed-capacity ring of (time-seconds-since-start, sample) pairs.
@@ -76,6 +90,10 @@ impl App {
             Some(path) => HistoryStore::load(path),
             None => HistoryStore::default(),
         };
+        // Menu-bar agent mode (macOS, or any host started hidden): the window
+        // exists but is not shown at launch; the tray / `--hidden` toggles it.
+        let start_hidden =
+            cfg!(target_os = "macos") || std::env::var("BATTERY_VIZ_START_HIDDEN").is_ok();
         App {
             rx,
             latest: None,
@@ -85,6 +103,11 @@ impl App {
             history_path,
             last_error: None,
             frames_rendered: 0,
+            alert_engine: AlertEngine::new(),
+            alerts_paused: false,
+            last_alert: None,
+            window_visible: !start_hidden,
+            start: std::time::Instant::now(),
         }
     }
 
@@ -107,10 +130,39 @@ impl App {
         for sample in &samples {
             self.history.push(sample);
             self.record_history(sample);
+            self.tick_alerts(sample);
         }
         if let Some(sample) = samples.into_iter().last() {
             self.benchmark = Some(benchmark::evaluate(&sample));
             self.latest = Some(sample);
+        }
+    }
+
+    /// Advance the alert engine by one sample and deliver a nudge when it
+    /// fires. Pausing resets the engine: sustain windows from before the
+    /// pause cannot fire stale alerts on resume.
+    fn tick_alerts(&mut self, sample: &crate::collect::BatterySample) {
+        if self.alerts_paused {
+            return;
+        }
+        let local = clock::local_now();
+        let tick = ClockInput {
+            now_s: self.start.elapsed().as_secs_f64(),
+            hour: local.hour,
+            day: local.day,
+        };
+        if let Some(alert) = self.alert_engine.tick(sample, tick) {
+            self.last_alert = Some(alert);
+            notify::send(alert.kind.label(), alert.message);
+        }
+    }
+
+    /// Pause/unpause coaching nudges. Resetting the engine means a pause of
+    /// any length never surfaces a backlog of stale conditions on resume.
+    pub fn set_alerts_paused(&mut self, paused: bool) {
+        if self.alerts_paused != paused {
+            self.alerts_paused = paused;
+            self.alert_engine = AlertEngine::new();
         }
     }
 
@@ -139,9 +191,14 @@ impl App {
         Ok(path)
     }
 
-    /// Next-wake interval for eframe: paint continuously for smooth
-    /// animations; battery data itself only changes at 1 Hz.
+    /// Wake interval for eframe. Visible: paint continuously for smooth
+    /// animations. Hidden (menu-bar agent): the sample tick at 1 Hz is the
+    /// only wake — no GPU frame, no egui draw, engine still advances.
     pub fn repaint_interval(&self) -> Duration {
-        Duration::from_millis(16)
+        if self.window_visible {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_secs(1)
+        }
     }
 }
