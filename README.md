@@ -8,8 +8,33 @@ optimization benchmark, rendered with egui on **wgpu** (GPU, no idle stall).
 
 ```sh
 cargo run            # run the dashboard (simulator on non macOS/Windows hosts)
-cargo test           # 18 unit tests: parsers, model, benchmark
+cargo test --all-targets   # 50 unit tests: parsers, model, benchmark, alerts
 ```
+
+## Alerts — battery-longevity coaching
+
+The app watches telemetry continuously and nudges rarely, quietly, and only
+with one concrete action per nudge (`src/alert.rs`, a pure state machine fed
+once per 1 Hz sample):
+
+- **Running hot** — pack ≥ 45 °C sustained for 60 s; stays active until the
+  pack cools below 42 °C; at most 3 nudges/day, 15 min apart.
+- **High-charge dwell** — parked at ≥ 95 % for 10 minutes: unplug or enable
+  optimized charging; at most 1/day, 6 h apart.
+- **Charge band** — plugged in above 80 %: one unplug nudge per day.
+
+Quiet hours (22:00–08:00 local) suppress everything. Pause lives in the macOS
+tray menu; pausing resets the engine so no stale alert fires on resume.
+
+- **macOS** — menu-bar agent: window hidden at launch (LSUIElement accessory,
+  no Dock icon); the tray icon (show dashboard / pause alerts / quit) drives
+  the app; notifications via `osascript display notification`.
+- **Windows** — main window as before; alerts are WinRT toasts spawned via a
+  PowerShell one-liner, so they inherit Focus Assist. No tray agent.
+
+Memory discipline: while hidden, no egui frame is drawn — the 1 Hz sample tick
+wakes the engine and tray only; the GPU runs at `LowPower` power preference.
+The release profile is size-optimized (`opt-level = "z"`, fat LTO, stripped).
 
 ## What it shows
 
@@ -53,10 +78,13 @@ never inherits collector lag.
 
 ```
 src/
-  main.rs            entry point, window options
-  app.rs             sample ingest, 600-sample history ring
+  main.rs            entry point, window options (menu-bar agent on macOS)
+  app.rs             sample ingest, 600-sample history ring, alert ticks
   ui/mod.rs          egui dashboard (ring, gauges, scorecard, plots)
   benchmark/mod.rs   weighted scoring engine
+  alert.rs           pure coaching-alert state machine (cooldowns, caps, quiet hours)
+  clock.rs           injectable local hour/day for the alert engine
+  notify/            platform notifications (macOS osascript, Windows toast)
   collect/
     mod.rs           trait, background thread, platform dispatch
     macos.rs         ioreg plist parser

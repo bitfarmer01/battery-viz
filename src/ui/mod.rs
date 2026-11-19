@@ -16,11 +16,33 @@ pub struct Dashboard {
     app: App,
     /// Status line after the last CSV export (destination path or error).
     export_status: Option<String>,
+    /// macOS tray agent (menu: show dashboard / pause alerts / quit). `None`
+    /// when the tray could not be built — the app degrades to banner-only
+    /// alerting with the reason surfaced through the notify error sink,
+    /// instead of aborting.
+    #[cfg(target_os = "macos")]
+    tray: Option<crate::notify::macos::MacosTray>,
+    /// Set when the user chooses Quit in the tray: close proceeds through
+    /// eframe's normal teardown instead of the hide-to-tray intercept.
+    #[cfg(target_os = "macos")]
+    quit_requested: bool,
 }
 
 impl Dashboard {
     pub fn new(app: App) -> Self {
+        #[cfg(target_os = "macos")]
+        let tray = match crate::notify::macos::MacosTray::new(app.alerts_paused) {
+            Ok(tray) => Some(tray),
+            Err(e) => {
+                crate::notify::record_notify_error(format!("tray unavailable: {e}"));
+                None
+            }
+        };
         Dashboard {
+            #[cfg(target_os = "macos")]
+            tray,
+            #[cfg(target_os = "macos")]
+            quit_requested: false,
             app,
             export_status: None,
         }
@@ -29,10 +51,59 @@ impl Dashboard {
 
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Close-to-tray: closing the dashboard window hides it (the menu-bar
+        // agent keeps running); only an explicit tray Quit ends the process,
+        // and it does so through eframe's normal teardown path.
+        #[cfg(target_os = "macos")]
+        {
+            use egui::ViewportCommand;
+            if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
+                self.app.window_visible = false;
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+        }
+
+        // Tray commands arrive between repaints; handle them first.
+        #[cfg(target_os = "macos")]
+        self.handle_tray_commands(ctx);
+
         self.app.update();
-        draw(ctx, &mut self.app, &mut self.export_status);
-        // Continuous repaint keeps gauges and plots smooth.
+
+        // Hidden (menu-bar agent) mode: the 1 Hz tick advances the engine and
+        // collector, but no GPU frame is rendered while the window is hidden.
+        if self.app.window_visible {
+            draw(ctx, &mut self.app, &mut self.export_status);
+        }
         ctx.request_repaint_after(self.app.repaint_interval());
+    }
+}
+
+impl Dashboard {
+    /// Tray commands arrive between repaints; handle every drained event.
+    #[cfg(target_os = "macos")]
+    fn handle_tray_commands(&mut self, ctx: &egui::Context) {
+        use crate::notify::macos::TrayCommand;
+        use egui::ViewportCommand;
+        let commands = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for command in commands {
+            match command {
+                TrayCommand::ShowDashboard => {
+                    self.app.window_visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(1280.0, 800.0)));
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+                TrayCommand::SetPaused(paused) => self.app.set_alerts_paused(paused),
+                // Clean shutdown: request the viewport close and let eframe
+                // unwind normally (the hide-to-tray intercept yields because
+                // `quit_requested` is set).
+                TrayCommand::Quit => {
+                    self.quit_requested = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
     }
 }
 
@@ -78,9 +149,39 @@ fn draw(
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(230, 120, 90), format!("⚠ {err}"));
             }
+            if let Some(err) = &app.last_notify_error {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 180, 90),
+                    format!("⚠ notifications: {err}"),
+                );
+            }
+            ui.separator();
+            let pause_label = if app.alerts_paused { "▶ Resume alerts" } else { "⏸ Pause alerts" };
+            if ui.button(pause_label).clicked() {
+                app.set_alerts_paused(!app.alerts_paused);
+            }
+            if app.alerts_paused {
+                ui.weak("alerts paused");
+            }
         });
         ui.add_space(8.0);
     });
+
+    // Coaching-nudge banner: the latest alert stays visible until dismissed.
+    if let Some(alert) = app.last_alert {
+        egui::TopBottomPanel::top("alert_banner").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(240, 190, 90), "💡");
+                ui.label(alert.message);
+                if ui.small_button("Dismiss").clicked() {
+                    app.last_alert = None;
+                }
+            });
+            ui.add_space(6.0);
+        });
+    }
 
     egui::CentralPanel::default()
         .frame(
