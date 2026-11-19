@@ -1,0 +1,9 @@
+branches:
+  defaultBase: main
+pr:
+  merge:
+    method: merge
+reviews:
+  routing:
+    rules:
+      - { name: all, match: ["**"], mode: none }
