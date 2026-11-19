@@ -29,8 +29,10 @@ pub struct MacosTray {
 
 impl MacosTray {
     /// Build the tray. Must run on the main thread while an NSApplication
-    /// event loop exists (eframe provides one).
-    pub fn new(paused: bool) -> Self {
+    /// event loop exists (eframe provides one). Fallible: in menu-bar agent
+    /// mode a failed tray degrades the app to banner-only alerting instead
+    /// of aborting — the error surfaces in the dashboard header.
+    pub fn new(paused: bool) -> Result<Self, String> {
         let show_item = MenuItem::new("Show Dashboard", true, None);
         let pause_item = CheckMenuItem::new("Pause Alerts", true, paused, None);
         let quit_item = MenuItem::new("Quit", true, None);
@@ -40,32 +42,35 @@ impl MacosTray {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Battery Viz — battery longevity coach")
-            .with_icon(battery_icon())
+            .with_icon(battery_icon()?)
             .build()
-            .expect("build tray icon");
+            .map_err(|e| format!("build tray icon: {e}"))?;
 
-        MacosTray { _tray: tray, show_item, pause_item, quit_item }
+        Ok(MacosTray { _tray: tray, show_item, pause_item, quit_item })
     }
 
-    /// Drain pending menu events; returns the first command, if any.
-    pub fn poll(&self) -> Option<TrayCommand> {
+    /// Drain ALL pending menu events — clicks that arrive within one wake
+    /// (up to 1 s in hidden mode) are queued, not collapsed.
+    pub fn poll(&self) -> Vec<TrayCommand> {
         let events = MenuEvent::receiver();
-        let mut command = None;
+        let mut commands = Vec::new();
         while let Ok(event) = events.try_recv() {
             if event.id == self.show_item.id() {
-                command = Some(TrayCommand::ShowDashboard);
+                commands.push(TrayCommand::ShowDashboard);
             } else if event.id == self.pause_item.id() {
-                command = Some(TrayCommand::SetPaused(self.pause_item.is_checked()));
+                commands.push(TrayCommand::SetPaused(self.pause_item.is_checked()));
             } else if event.id == self.quit_item.id() {
-                command = Some(TrayCommand::Quit);
+                commands.push(TrayCommand::Quit);
             }
         }
-        command
+        commands
     }
 }
 
 /// Deliver a notification via AppleScript. Spawned detached so the UI thread
-/// never waits on `osascript` startup.
+/// never waits on `osascript` startup; the detached thread reaps the child
+/// (`status()`) and surfaces failures instead of leaving zombies or silent
+/// errors behind.
 pub fn send_notification(title: &str, body: &str) {
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
@@ -74,8 +79,13 @@ pub fn send_notification(title: &str, body: &str) {
     );
     std::thread::Builder::new()
         .name("notify-osascript".into())
-        .spawn(move || {
-            let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+        .spawn(move || match std::process::Command::new("osascript").args(["-e", &script]).status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => crate::notify::record_notify_error(format!(
+                "osascript notification failed (exit {status})"
+            )),
+            Err(e) => crate::notify::record_notify_error(format!("osascript spawn failed: {e}")),
         })
         .ok();
 }
@@ -87,7 +97,7 @@ fn applescript_escape(s: &str) -> String {
 
 /// A tiny fixed 16×16 battery glyph so the tray is not an empty square.
 /// Built at startup (one allocation, once — never on the tick path).
-fn battery_icon() -> Icon {
+fn battery_icon() -> Result<Icon, String> {
     const W: usize = 16;
     const H: usize = 16;
     let mut rgba = vec![0u8; W * H * 4];
@@ -114,5 +124,5 @@ fn battery_icon() -> Icon {
             set(x, y, &mut rgba);
         }
     }
-    Icon::from_rgba(rgba, W as u32, H as u32).expect("tray icon size")
+    Icon::from_rgba(rgba, W as u32, H as u32).map_err(|e| format!("tray icon: {e:?}"))
 }

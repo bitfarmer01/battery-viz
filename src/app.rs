@@ -26,6 +26,10 @@ pub struct App {
     /// Where the store persists; `None` when no platform data dir exists.
     history_path: Option<PathBuf>,
     pub last_error: Option<String>,
+    /// Most recent platform-notification delivery failure (osascript /
+    /// PowerShell / AUMID registration / tray build), shown in the header so
+    /// a dead alert path is never silent.
+    pub last_notify_error: Option<String>,
     pub frames_rendered: u64,
     /// Pure alert state machine; advanced once per incoming sample (1 Hz).
     alert_engine: AlertEngine,
@@ -83,6 +87,9 @@ pub fn default_history_path() -> Option<PathBuf> {
 
 impl App {
     pub fn new(rx: Receiver<CollectorResult>) -> Self {
+        // One-time platform setup: on Windows this registers the toast AUMID
+        // so later toasts are not suppressed by the OS.
+        notify::init();
         // Load persisted history on startup; a missing or corrupt file starts
         // fresh (handled inside `HistoryStore::load`).
         let history_path = default_history_path();
@@ -102,6 +109,7 @@ impl App {
             history_store,
             history_path,
             last_error: None,
+            last_notify_error: None,
             frames_rendered: 0,
             alert_engine: AlertEngine::new(),
             alerts_paused: false,
@@ -114,6 +122,12 @@ impl App {
     /// Drain pending samples (non-blocking) and refresh derived state.
     pub fn update(&mut self) {
         self.frames_rendered += 1;
+        // Surface any platform-notification failure observed since the last
+        // tick (osascript / PowerShell / AUMID / tray build). Sticky: it
+        // stays visible until the next failure replaces it.
+        if let Some(e) = notify::take_notify_error() {
+            self.last_notify_error = Some(e);
+        }
         // Drain first, then mutate: the channel iterator borrows `self.rx`,
         // so `&mut self` methods cannot run inside the loop.
         let samples: Vec<crate::collect::BatterySample> = self

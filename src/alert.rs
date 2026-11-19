@@ -719,18 +719,36 @@ mod tests {
     }
 
     #[test]
-    fn at_most_one_alert_per_tick() {
-        // All three conditions hot at once: exactly one alert comes out per
-        // tick, and the engine drains them across ticks, not in a burst.
+    fn session_fire_counts_match_caps_and_cooldowns() {
+        // HighTemp across a 1,000-tick (1 Hz) session with resolve and
+        // re-sustain: fire #1 at t=60s (sustained); resolve at t=61 (temp
+        // drops below the 42 °C hysteresis); re-sustained from t=121, but
+        // the 15 min cooldown holds until t=960 — fire #2 lands there, not
+        // at t=181. The struct-level "one value per tick" property is
+        // guaranteed by `tick` returning an Option; what this verifies is
+        // hysteresis re-arming plus cooldown gating. DwellCoach (600 s of
+        // ≥95%) and BandCoach (first tick in band) each cap at 1/day.
         let mut e = AlertEngine::new();
-        let s = sample(Some(50.0), Some(100.0), ChargingState::Charging);
-        let mut per_tick = 0;
+        let hot = sample(Some(50.0), Some(100.0), ChargingState::Charging);
+        let cool = sample(Some(40.0), Some(100.0), ChargingState::Charging);
+        let (mut fires, mut hot_fires) = (Vec::new(), 0);
         for i in 0..1_000 {
             let c = ClockInput { now_s: i as f64, hour: NOON_HOUR, day: DAY };
-            if e.tick(&s, c).is_some() {
-                per_tick += 1;
+            let s = if (61..=120).contains(&i) { &cool } else { &hot };
+            if let Some(a) = e.tick(s, c) {
+                fires.push((i, a.kind));
+                if matches!(a.kind, AlertKind::HighTemp) {
+                    hot_fires += 1;
+                }
             }
-            assert!(per_tick <= 3, "daily caps bound total fires");
         }
+        assert_eq!(hot_fires, 2, "fire, resolve, re-sustain, cooldown-gated refire");
+        assert!(fires.iter().any(|&(t, k)| k == AlertKind::HighTemp && t >= 960));
+        assert!(
+            !fires.iter().any(|&(t, k)| k == AlertKind::HighTemp && (181..960).contains(&t)),
+            "no HighTemp fire inside the cooldown"
+        );
+        assert_eq!(fires.iter().filter(|(_, k)| *k == AlertKind::DwellCoach).count(), 1);
+        assert_eq!(fires.iter().filter(|(_, k)| *k == AlertKind::BandCoach).count(), 1);
     }
 }

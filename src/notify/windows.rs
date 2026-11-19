@@ -10,8 +10,48 @@
 
 use std::os::windows::process::CommandExt;
 
+/// The AppUserModelId toasts are shown under. Windows suppresses unpackaged
+/// WinRT toasts from an unregistered AUMID, so this is registered (per-user,
+/// idempotent) before the first toast can fire.
+const AUMID: &str = "Battery Viz";
+
+/// Register the AUMID once per run: `HKCU\SOFTWARE\Classes\AppUserModelId\
+/// Battery Viz` with a DisplayName. Runs detached; failures surface through
+/// `notify::take_notify_error`, never silently.
+pub fn ensure_aumid_registered() {
+    std::thread::Builder::new()
+        .name("aumid-register".into())
+        .spawn(|| {
+            let key = format!(r"HKCU\SOFTWARE\Classes\AppUserModelId\{AUMID}");
+            let result = std::process::Command::new("reg")
+                .args([
+                    "add",
+                    &key,
+                    "/v",
+                    "DisplayName",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    AUMID,
+                    "/f",
+                ])
+                .status();
+            match result {
+                Ok(status) if status.success() => {}
+                Ok(status) => crate::notify::record_notify_error(format!(
+                    "toast AUMID registration failed (reg exit {status}); toasts may be suppressed"
+                )),
+                Err(e) => {
+                    crate::notify::record_notify_error(format!("toast AUMID registration: {e}"))
+                }
+            }
+        })
+        .ok();
+}
+
 /// Spawn a toast. PowerShell cold-starts slowly (~100–300 ms), so the call
-/// runs detached: the UI thread never blocks on it.
+/// runs detached: the UI thread never blocks on it. The child's exit status
+/// is checked in the detached thread — a failed toast path is never silent.
 pub fn send_toast(title: &str, body: &str) {
     let script = toast_script(title, body);
     std::thread::Builder::new()
@@ -28,7 +68,13 @@ pub fn send_toast(title: &str, body: &str) {
             ]);
             // CREATE_NO_WINDOW: no console flash when spawned from a GUI app.
             command.creation_flags(0x0800_0000);
-            let _ = command.spawn();
+            match command.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => crate::notify::record_notify_error(format!(
+                    "toast delivery failed (powershell exit {status})"
+                )),
+                Err(e) => crate::notify::record_notify_error(format!("toast spawn failed: {e}")),
+            }
         })
         .ok();
 }

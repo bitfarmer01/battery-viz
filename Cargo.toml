@@ -20,9 +20,10 @@ wmi = "0.14"
 # Menu-bar tray (show dashboard / pause alerts / quit).
 tray-icon = "0.19"
 # Same event-loop crate eframe already vendors; pinned to the version eframe
-# uses so nothing new is compiled in. Needed only for the Accessory
-# activation policy (LSUIElement agent mode).
-winit = "0.30"
+# uses with eframe's feature set (defaults off — the defaults would pull
+# extra Wayland decoration crates into non-macOS unified builds). Needed
+# only for the Accessory activation policy (LSUIElement agent mode).
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 
 [profile.release]
 # Size-optimized release build (spec: binary-size budget).
