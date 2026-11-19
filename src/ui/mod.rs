@@ -14,18 +14,23 @@ use crate::collect::types::{state_of_health_pct, ChargingState};
 
 pub struct Dashboard {
     app: App,
+    /// Status line after the last CSV export (destination path or error).
+    export_status: Option<String>,
 }
 
 impl Dashboard {
     pub fn new(app: App) -> Self {
-        Dashboard { app }
+        Dashboard {
+            app,
+            export_status: None,
+        }
     }
 }
 
 impl eframe::App for Dashboard {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.update();
-        draw(ctx, &mut self.app);
+        draw(ctx, &mut self.app, &mut self.export_status);
         // Continuous repaint keeps gauges and plots smooth.
         ctx.request_repaint_after(self.app.repaint_interval());
     }
@@ -44,7 +49,11 @@ fn score_color(v: f64) -> egui::Color32 {
     egui::Color32::from_rgb(r as u8, g as u8, 70)
 }
 
-fn draw(ctx: &egui::Context, app: &mut App) {
+fn draw(
+    ctx: &egui::Context,
+    app: &mut App,
+    export_status: &mut Option<String>,
+) {
     egui::TopBottomPanel::top("header").show(ctx, |ui| {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -94,6 +103,7 @@ fn draw(ctx: &egui::Context, app: &mut App) {
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 draw_live_gauges(ui, app);
                 draw_plots(ui, app);
+                draw_trends(ui, app, export_status);
             });
         });
 }
@@ -274,5 +284,71 @@ fn draw_plots(ui: &mut egui::Ui, app: &App) {
                     .color(score_color(50.0)),
                 );
             });
+    });
+}
+
+/// Long-horizon trends from the downsampled store: charge and temperature
+/// over the full retained window (up to 7 days of 1-minute means), plus CSV
+/// export of the same data.
+fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>) {
+    ui.add_space(8.0);
+    ui.heading("Trends — up to 7 days, 1-minute averages");
+    let store = &app.history_store;
+    if store.buckets.is_empty() {
+        ui.weak("Long-term history builds one minute at a time and loads from disk on startup…");
+        return;
+    }
+
+    // X axis: hours ago, so the window reads naturally without date ticks.
+    let now_min = crate::history::unix_now() / 60;
+    let hours_ago = |minute: u64| now_min.saturating_sub(minute) as f64 / 60.0;
+    let trend_points = |values: Vec<Option<f64>>| -> Vec<[f64; 2]> {
+        store
+            .buckets
+            .iter()
+            .zip(values)
+            .filter_map(|(b, v)| v.map(|v| [hours_ago(b.minute), v]))
+            .collect()
+    };
+    let charge = trend_points(store.buckets.iter().map(|b| b.soc_mean()).collect());
+    let temp = trend_points(store.buckets.iter().map(|b| b.temp_mean()).collect());
+
+    ui.columns(2, |cols| {
+        cols[0].label("Charge (%)");
+        Plot::new("trend_charge_plot")
+            .height(160.0)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .show_axes([false, true])
+            .show(&mut cols[0], |plot| {
+                plot.line(
+                    Line::new(PlotPoints::from_iter(charge.iter().copied()))
+                        .color(score_color(90.0)),
+                );
+            });
+        cols[1].label("Temperature (°C)");
+        Plot::new("trend_temp_plot")
+            .height(160.0)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .show_axes([false, true])
+            .show(&mut cols[1], |plot| {
+                plot.line(
+                    Line::new(PlotPoints::from_iter(temp.iter().copied()))
+                        .color(score_color(75.0)),
+                );
+            });
+    });
+
+    ui.horizontal(|ui| {
+        if ui.button("Export CSV").clicked() {
+            *export_status = Some(match app.export_csv() {
+                Ok(path) => format!("Exported to {}", path.display()),
+                Err(e) => format!("Export failed: {e}"),
+            });
+        }
+        if let Some(status) = export_status {
+            ui.weak(egui::RichText::new(status.as_str()).small());
+        }
     });
 }
