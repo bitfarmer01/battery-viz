@@ -17,34 +17,29 @@ pub struct LocalNow {
 
 /// Read the OS local time.
 pub fn local_now() -> LocalNow {
-    let unix_day = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0)) as u32;
-
     #[cfg(unix)]
     {
-        unix_local_hour().map(|hour| LocalNow { hour, day: unix_day }).unwrap_or(LocalNow {
-            hour: utc_hour_fallback(),
-            day: unix_day,
-        })
+        unix_local_now().unwrap_or_else(utc_fallback_now)
     }
 
     #[cfg(windows)]
     {
-        LocalNow { hour: windows_local_hour(), day: unix_day }
+        let (hour, day) = windows_local_now();
+        LocalNow { hour, day }
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        LocalNow { hour: utc_hour_fallback(), day: unix_day }
+        utc_fallback_now()
     }
 }
 
-/// Local hour from libc `localtime_r`, declared inline so no new dependency
-/// is added. Returns `None` if the call unexpectedly fails.
+/// Local hour and day from libc `localtime_r`, declared inline so no new
+/// dependency is added. The day counter is local-consistent: the epoch
+/// seconds are shifted by the timezone offset before dividing, so daily
+/// caps roll over at local midnight. Returns `None` if the call fails.
 #[cfg(unix)]
-fn unix_local_hour() -> Option<u8> {
+fn unix_local_now() -> Option<LocalNow> {
     // Matches `struct tm` on 64-bit Linux (glibc) and macOS.
     #[repr(C)]
     struct Tm {
@@ -85,14 +80,18 @@ fn unix_local_hour() -> Option<u8> {
     // localtime_r returns the result pointer on success, NULL on failure.
     let ok = unsafe { !localtime_r(&now, &mut tm).is_null() };
     if ok {
-        Some(tm.tm_hour.clamp(0, 23) as u8)
+        let hour = tm.tm_hour.clamp(0, 23) as u8;
+        let local_secs = now + tm.tm_gmtoff;
+        let day = local_secs.div_euclid(86_400) as u32;
+        Some(LocalNow { hour, day })
     } else {
         None
     }
 }
 
+/// Local hour and day index (days since local epoch) from WinAPI.
 #[cfg(windows)]
-fn windows_local_hour() -> u8 {
+fn windows_local_now() -> (u8, u32) {
     #[repr(C)]
     struct SystemTime {
         w_year: u16,
@@ -120,18 +119,32 @@ fn windows_local_hour() -> u8 {
         w_milliseconds: 0,
     };
     unsafe { GetLocalTime(&mut st) };
-    st.w_hour.clamp(0, 23) as u8
+    let hour = st.w_hour.clamp(0, 23) as u8;
+    let day = days_from_civil(st.w_year as i64, st.w_month as i64, st.w_day as i64) as u32;
+    (hour, day)
+}
+
+/// Days since 1970-01-01 from a civil date (Hinnant's days_from_civil).
+#[cfg(windows)]
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// No libc/WinAPI available (non-unix, non-Windows builds): fall back to UTC.
 /// Quiet hours then follow UTC; acceptable for a host that has neither of
 /// the two supported platform APIs.
-fn utc_hour_fallback() -> u8 {
+fn utc_fallback_now() -> LocalNow {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    ((secs / 3_600) % 24) as u8
+        .unwrap_or(0) as i64;
+    LocalNow { hour: ((secs / 3_600) % 24) as u8, day: (secs / 86_400).max(0) as u32 }
 }
 
 #[cfg(test)]
