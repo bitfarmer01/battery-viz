@@ -131,11 +131,9 @@ impl App {
 
     /// Write the retained window to `<data dir>/battery-viz-export.csv`.
     pub fn export_csv(&self) -> Result<PathBuf, String> {
-        let dir = dirs::data_dir()
+        let path = dirs::data_dir()
             .ok_or_else(|| "no platform data directory".to_string())?
-            .join("battery-viz");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
-        let path = dir.join("battery-viz-export.csv");
+            .join("battery-viz-export.csv");
         std::fs::write(&path, self.history_store.to_csv())
             .map_err(|e| format!("write CSV: {e}"))?;
         Ok(path)
