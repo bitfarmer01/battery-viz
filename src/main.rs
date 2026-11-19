@@ -3,6 +3,7 @@
 mod app;
 mod benchmark;
 mod collect;
+mod history;
 mod ui;
 
 fn main() -> eframe::Result<()> {

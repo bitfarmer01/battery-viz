@@ -1,12 +1,14 @@
 //! Application state: drains the collector channel, keeps a bounded history
 //! ring, and re-evaluates the benchmark as samples arrive.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 
 use crate::benchmark::{self, BenchmarkResult};
 use crate::collect::CollectorResult;
+use crate::history::HistoryStore;
 
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
@@ -16,6 +18,10 @@ pub struct App {
     pub latest: Option<crate::collect::BatterySample>,
     pub benchmark: Option<BenchmarkResult>,
     pub history: History,
+    /// Downsampled long-term store (1-minute buckets, 7-day retention).
+    pub history_store: HistoryStore,
+    /// Where the store persists; `None` when no platform data dir exists.
+    history_path: Option<PathBuf>,
     pub last_error: Option<String>,
     pub frames_rendered: u64,
 }
@@ -55,13 +61,28 @@ impl History {
     }
 }
 
+/// Where the long-term history persists: `<data dir>/battery-viz/history.json`
+/// (macOS `~/Library/Application Support`, Windows `%APPDATA%`, XDG data dir).
+pub fn default_history_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("battery-viz").join("history.json"))
+}
+
 impl App {
     pub fn new(rx: Receiver<CollectorResult>) -> Self {
+        // Load persisted history on startup; a missing or corrupt file starts
+        // fresh (handled inside `HistoryStore::load`).
+        let history_path = default_history_path();
+        let history_store = match &history_path {
+            Some(path) => HistoryStore::load(path),
+            None => HistoryStore::default(),
+        };
         App {
             rx,
             latest: None,
             benchmark: None,
             history: History::new(),
+            history_store,
+            history_path,
             last_error: None,
             frames_rendered: 0,
         }
@@ -70,24 +91,54 @@ impl App {
     /// Drain pending samples (non-blocking) and refresh derived state.
     pub fn update(&mut self) {
         self.frames_rendered += 1;
-        let mut newest: Option<crate::collect::BatterySample> = None;
-        let mut error: Option<String> = None;
-        for result in self.rx.try_iter() {
-            match result {
-                Ok(sample) => {
-                    self.history.push(&sample);
-                    newest = Some(sample);
+        // Drain first, then mutate: the channel iterator borrows `self.rx`,
+        // so `&mut self` methods cannot run inside the loop.
+        let samples: Vec<crate::collect::BatterySample> = self
+            .rx
+            .try_iter()
+            .filter_map(|result| match result {
+                Ok(sample) => Some(sample),
+                Err(e) => {
+                    self.last_error = Some(e);
+                    None
                 }
-                Err(e) => error = Some(e),
-            }
+            })
+            .collect();
+        for sample in &samples {
+            self.history.push(sample);
+            self.record_history(sample);
         }
-        if let Some(sample) = newest {
+        if let Some(sample) = samples.into_iter().last() {
             self.benchmark = Some(benchmark::evaluate(&sample));
             self.latest = Some(sample);
         }
-        if error.is_some() {
-            self.last_error = error;
+    }
+
+    /// Fold a sample into the long-term store; persist after each NEW bucket
+    /// (write-behind on the UI thread — the spec pins one write per bucket,
+    /// no background thread). Persistence failures surface in the header,
+    /// they never take the dashboard down.
+    fn record_history(&mut self, sample: &crate::collect::BatterySample) {
+        let created_new_bucket = self.history_store.push(sample, crate::history::unix_now());
+        if created_new_bucket {
+            if let Some(path) = &self.history_path {
+                if let Err(e) = self.history_store.save(path) {
+                    self.last_error = Some(e);
+                }
+            }
         }
+    }
+
+    /// Write the retained window to `<data dir>/battery-viz-export.csv`.
+    pub fn export_csv(&self) -> Result<PathBuf, String> {
+        let dir = dirs::data_dir()
+            .ok_or_else(|| "no platform data directory".to_string())?
+            .join("battery-viz");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
+        let path = dir.join("battery-viz-export.csv");
+        std::fs::write(&path, self.history_store.to_csv())
+            .map_err(|e| format!("write CSV: {e}"))?;
+        Ok(path)
     }
 
     /// Next-wake interval for eframe: paint continuously for smooth

@@ -11,6 +11,7 @@ egui_plot = "0.29"
 serde = { version = "1", features = ["derive"] }
 plist = "1"
 crossbeam-channel = "0.5"
+dirs = "5"
 
 [target.'cfg(windows)'.dependencies]
 wmi = "0.14"
