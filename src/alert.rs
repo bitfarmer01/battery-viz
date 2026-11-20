@@ -4,7 +4,9 @@
 //! - `HighTemp` — pack ≥ 45 °C sustained 60 s; resolves below 42 °C
 //!   (hysteresis); 15-minute cooldown; max 3/day.
 //! - `DwellCoach` — ≥ 95 % charge for 10 min; 6-hour cooldown; max 1/day.
-//! - `BandCoach` — plugged in and ≥ 80 %; one unplug nudge per day.
+//! - `BandCoach` — plugged in and ≥ 80 %; one unplug nudge per day. Machines
+//!   sitting on AC, not charging, at or near the threshold are treated as
+//!   already running an externally-set charge cap and are not nudged.
 //! - Quiet hours 22:00–08:00 local suppress everything (no critical alerts
 //!   exist); a suppressed fire is dropped, never queued, and consumes neither
 //!   cooldown nor daily cap.
@@ -269,6 +271,14 @@ impl AlertEngine {
             st.latched = false;
             return None;
         }
+        // An externally-set charge cap parks a machine on AC, not charging,
+        // at the limit. Nudging it to "set an 80% limit" would nag it about
+        // the cap it already has, so the nudge is suppressed — without
+        // consuming the daily cap or latching (audit finding H5). Lightweight
+        // cap signal only; full cap detection is roadmap FR-1.
+        if is_detected_cap(sample) {
+            return None;
+        }
         if st.latched || clock.is_quiet_hours() || st.daily.exhausted(BAND_MAX_PER_DAY) {
             return None;
         }
@@ -288,6 +298,18 @@ fn is_plugged(sample: &BatterySample) -> bool {
             | Some(ChargingState::Full)
             | Some(ChargingState::OnAcNotCharging)
     )
+}
+
+/// Pure predicate: does this sample look like an externally-set charge cap?
+/// True when the machine is on AC, not charging, parked at the band
+/// threshold — the state a capped machine settles in. On-AC readings below
+/// the threshold never fire anyway (they are outside the band), so no
+/// separate tolerance is needed.
+fn is_detected_cap(sample: &BatterySample) -> bool {
+    sample.charging_state == Some(ChargingState::OnAcNotCharging)
+        && sample
+            .state_of_charge
+            .is_some_and(|s| s >= BAND_SOC_PCT)
 }
 
 #[cfg(test)]
@@ -680,10 +702,17 @@ mod tests {
     }
 
     #[test]
-    fn band_on_ac_not_charging_counts_as_plugged() {
+    fn band_full_counts_as_plugged_but_on_ac_not_charging_is_a_cap() {
         let mut e = AlertEngine::new();
-        let s = sample(None, Some(95.0), ChargingState::OnAcNotCharging);
-        assert!(tick_at(&mut e, &s, 1.0).is_some());
+        // `Full` counts as plugged in — a full pack with no cap set is
+        // exactly who the unplug nudge is for.
+        let full = sample(None, Some(95.0), ChargingState::Full);
+        assert!(tick_at(&mut e, &full, 1.0).is_some());
+        // On AC, not charging, in the band: a detected externally-set cap
+        // (audit H5) — never nudged.
+        let capped = sample(None, Some(95.0), ChargingState::OnAcNotCharging);
+        let mut fresh = AlertEngine::new();
+        assert!(!tick_kind(&mut fresh, &capped, 1.0, AlertKind::BandCoach));
     }
 
     #[test]
@@ -701,6 +730,58 @@ mod tests {
         // Morning: the nudge still goes out that day.
         let c = ClockInput { now_s: 100.0, hour: 8, day: DAY };
         assert!(e.tick(&s, c).is_some());
+    }
+
+    // ---- H5: externally-set charge caps are not nagged ---------------------
+
+    #[test]
+    fn band_capped_machine_at_80_on_ac_never_fires() {
+        let mut e = AlertEngine::new();
+        // Exactly the audited machine: reads 80, on AC, not charging.
+        let capped = sample(None, Some(80.0), ChargingState::OnAcNotCharging);
+        assert_eq!(run_kind(&mut e, &capped, 3_600.0, AlertKind::BandCoach), 0);
+    }
+
+    #[test]
+    fn band_capped_machine_suppression_consumes_no_daily_cap() {
+        let mut e = AlertEngine::new();
+        let capped = sample(None, Some(80.0), ChargingState::OnAcNotCharging);
+        assert_eq!(run_kind(&mut e, &capped, 3_600.0, AlertKind::BandCoach), 0);
+        // Same day, the machine actively charges past 80: the nudge fires
+        // once — the capped episodes consumed nothing.
+        let charging = sample(None, Some(85.0), ChargingState::Charging);
+        assert!(tick_at(&mut e, &charging, 3_601.0).is_some());
+        assert!(!tick_kind(&mut e, &charging, 3_602.0, AlertKind::BandCoach));
+    }
+
+    #[test]
+    fn detected_cap_predicate_is_threshold_scoped_and_pure() {
+        // On AC, not charging, at or above the threshold: a detected cap.
+        assert!(is_detected_cap(&sample(None, Some(80.0), ChargingState::OnAcNotCharging)));
+        assert!(is_detected_cap(&sample(None, Some(95.0), ChargingState::OnAcNotCharging)));
+        // Just below the threshold: outside the band, not a cap signal.
+        assert!(!is_detected_cap(&sample(None, Some(79.9), ChargingState::OnAcNotCharging)));
+        // Other plugged-in states in the band are not cap signals.
+        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Charging)));
+        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Discharging)));
+        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Full)));
+        // Missing SOC is never treated as a cap.
+        assert!(!is_detected_cap(&sample(None, None, ChargingState::OnAcNotCharging)));
+    }
+
+    #[test]
+    fn band_charging_at_threshold_still_fires_once() {
+        // Actively charging past the threshold is real coaching, capped or not.
+        let mut e = AlertEngine::new();
+        let s = sample(None, Some(81.0), ChargingState::Charging);
+        assert_eq!(run_kind(&mut e, &s, 600.0, AlertKind::BandCoach), 1);
+    }
+
+    #[test]
+    fn band_discharging_at_80_never_fires() {
+        let mut e = AlertEngine::new();
+        let s = sample(None, Some(80.0), ChargingState::Discharging);
+        assert_eq!(run_kind(&mut e, &s, 600.0, AlertKind::BandCoach), 0);
     }
 
     // ---- Engine shape ------------------------------------------------------
