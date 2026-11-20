@@ -16,6 +16,7 @@ mod history;
 mod notify;
 mod ui;
 mod uninstall;
+mod warm;
 
 use eframe::egui::ViewportBuilder;
 

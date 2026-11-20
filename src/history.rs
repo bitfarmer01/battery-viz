@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::collect::types::{state_of_health_pct, BatterySample};
+use crate::collect::types::{state_of_health_pct, BatterySample, ChargingState};
 
 /// Retention window: 7 days of 1-minute buckets.
 pub const RETENTION_MINUTES: u64 = 7 * 24 * 60;
@@ -67,6 +67,10 @@ pub struct MinuteBucket {
     pub watts_n: u32,
     pub soh_sum: f64,
     pub soh_n: u32,
+    /// Samples in the bucket whose charging state was `Charging` (FR-4
+    /// warm-hour attribution). A count, not a mean, so partially populated
+    /// buckets keep an interpretable charging fraction.
+    pub chg_n: u32,
     /// Last cycle count seen in the bucket (cumulative counter, not a mean).
     pub cycles_last: Option<u32>,
 }
@@ -84,6 +88,7 @@ impl MinuteBucket {
             watts_n: 0,
             soh_sum: 0.0,
             soh_n: 0,
+            chg_n: 0,
             cycles_last: None,
         }
     }
@@ -109,6 +114,9 @@ impl MinuteBucket {
         if let Some(c) = s.cycle_count {
             self.cycles_last = Some(c);
         }
+        if matches!(s.charging_state, Some(ChargingState::Charging)) {
+            self.chg_n += 1;
+        }
     }
 
     pub fn soc_mean(&self) -> Option<f64> {
@@ -122,6 +130,16 @@ impl MinuteBucket {
     }
     pub fn soh_mean(&self) -> Option<f64> {
         mean(self.soh_sum, self.soh_n)
+    }
+
+    /// Fraction of this bucket's samples that reported `Charging` (0–1).
+    /// Buckets with no samples read 0 — there is no signal, never a guess.
+    pub fn charging_share(&self) -> f64 {
+        if self.n == 0 {
+            0.0
+        } else {
+            self.chg_n as f64 / self.n as f64
+        }
     }
 }
 
@@ -188,17 +206,17 @@ impl HistoryStore {
     }
 
     /// Serialize to the on-disk JSON schema:
-    /// `{"version":1,"buckets":[[minute,n,...sums/counts...,cycles],...]}`
+    /// `{"version":1,"buckets":[[minute,n,...sums/counts...,chg,cycles],...]}`
     /// (cycles is NaN when unknown). Rust's f64 Display round-trips.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(160 * self.buckets.len() + 32);
+        let mut out = String::with_capacity(170 * self.buckets.len() + 32);
         out.push_str("{\"version\":1,\"buckets\":[");
         for (i, b) in self.buckets.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
-                "[{},{},{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{}]",
                 b.minute,
                 b.n,
                 b.soc_sum,
@@ -209,9 +227,8 @@ impl HistoryStore {
                 b.watts_n,
                 b.soh_sum,
                 b.soh_n,
-                b.cycles_last
-                    .map(|c| c as f64)
-                    .unwrap_or(f64::NAN)
+                b.chg_n,
+                b.cycles_last.map(|c| c as f64).unwrap_or(f64::NAN)
             ));
         }
         out.push(']');
@@ -249,10 +266,18 @@ impl HistoryStore {
             }
             p.expect(b'[')?;
             let f: Vec<f64> = p.number_list()?;
-            if f.len() != 11 {
-                return Err(format!("bucket arity {} != 11", f.len()));
-            }
-            let cycle = f[10];
+            // 11 fields: the pre-FR-4 schema (no charging count) — still
+            // readable, so an old checkpoint is never quarantined. 12: the
+            // current schema. Anything else is corruption. Cycles is
+            // always the LAST field in either shape.
+            let cycle = f[f.len() - 1];
+            // Field order: minute, n, soc, temp, watts, soh, chg, cycles —
+            // the charging count sits at index 10 in the 12-field shape.
+            let chg_n = match f.len() {
+                12 => f[10] as u32,
+                11 => 0,
+                other => return Err(format!("bucket arity {other} != 12")),
+            };
             if !cycle.is_nan() && (cycle < 0.0 || cycle.fract() != 0.0) {
                 return Err(format!("invalid cycle count {cycle}"));
             }
@@ -267,6 +292,7 @@ impl HistoryStore {
                 watts_n: f[7] as u32,
                 soh_sum: f[8],
                 soh_n: f[9] as u32,
+                chg_n,
                 cycles_last: if cycle.is_nan() {
                     None
                 } else {
@@ -724,6 +750,57 @@ mod tests {
         let round = HistoryStore::from_json(&store.to_json()).expect("parse");
         assert_eq!(round, store);
         assert_eq!(round.buckets[0].cycles_last, None);
+    }
+
+    #[test]
+    fn charging_count_round_trips_through_json() {
+        let mut store = HistoryStore::default();
+        let mut charging = sample(50.0, Some(31.0));
+        charging.charging_state = Some(ChargingState::Charging);
+        store.push(&charging, MIN0);
+        store.push(&charging, MIN0 + 20); // same bucket, second charging sample
+        let round = HistoryStore::from_json(&store.to_json()).expect("parse");
+        assert_eq!(round.buckets[0].chg_n, 2);
+        assert_eq!(round.buckets[0].charging_share(), 1.0);
+    }
+
+    #[test]
+    fn legacy_arity_11_buckets_still_load() {
+        // A checkpoint written before FR-4 (no charging count) must load —
+        // never be quarantined — with charging unknown, treated as absent.
+        let row = format!(
+            "[{},{},{},{},{},{},{},{},{},{},{}]",
+            MIN0 / 60,
+            2,
+            "80.0",
+            "2", // soc
+            "62.0",
+            "2", // temp
+            "NaN",
+            "0.0", // watts
+            "90.0",
+            "2", // soh
+            "NaN", // cycles
+        );
+        let text = format!("{{\"version\":1,\"buckets\":[{row}]}}");
+        let store = HistoryStore::from_json(&text).expect("legacy parse");
+        assert_eq!(store.buckets.len(), 1);
+        assert_eq!(store.buckets[0].chg_n, 0);
+        assert_eq!(store.buckets[0].temp_mean(), Some(31.0));
+    }
+
+    #[test]
+    fn wrong_bucket_arity_is_rejected() {
+        let too_short = format!("{{\"version\":1,\"buckets\":[[{},{},{}]]}}", MIN0 / 60, 1, 1.0);
+        assert!(HistoryStore::from_json(&too_short).is_err());
+    }
+
+    #[test]
+    fn charging_share_is_zero_without_signal() {
+        let mut store = HistoryStore::default();
+        store.push(&sample(50.0, Some(31.0)), MIN0); // charging state None
+        assert_eq!(store.buckets[0].chg_n, 0);
+        assert_eq!(store.buckets[0].charging_share(), 0.0);
     }
 
     #[test]
