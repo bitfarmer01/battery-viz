@@ -50,6 +50,12 @@ impl Dashboard {
 }
 
 impl eframe::App for Dashboard {
+    /// M1: final checkpoint on a graceful exit (tray Quit or window close),
+    /// so a normal restart never loses the up-to-15-minute cadence window.
+    fn on_exit(&mut self) {
+        self.app.save_history_now();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Close-to-tray: closing the dashboard window hides it (the menu-bar
         // agent keeps running); only an explicit tray Quit ends the process,
@@ -155,6 +161,12 @@ fn draw(
                     egui::Color32::from_rgb(230, 180, 90),
                     format!("⚠ notifications: {err}"),
                 );
+            }
+            // Sticky notice: the persisted history could not be read and was
+            // preserved as `history.json.corrupt` (M2 — never silent).
+            if let Some(err) = &app.history_load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
             ui.separator();
             let pause_label = if app.alerts_paused { "▶ Resume alerts" } else { "⏸ Pause alerts" };

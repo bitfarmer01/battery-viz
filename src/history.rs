@@ -6,16 +6,20 @@
 //! window are dropped and the store is hard-capped so the backing file cannot
 //! grow unbounded.
 //!
-//! Persistence is a single JSON file in the platform data dir, rewritten
-//! after each new bucket (write-behind on the UI thread, no background
-//! thread). A missing or corrupt file starts fresh — telemetry history is
-//! disposable, never worth crashing over.
+//! Persistence is a single JSON file in the platform data dir. Checkpoints
+//! are written atomically (temp file + rename, see [`HistoryStore::save`]) at
+//! a bounded cadence (see `app::SAVE_INTERVAL_MINUTES`) plus once on graceful
+//! exit, so a crash mid-write can never corrupt the previous checkpoint. A
+//! file that cannot be read or parsed is moved aside to `<name>.corrupt`
+//! (kept, never deleted) and the store starts fresh; the reason is surfaced
+//! to the dashboard.
 //!
 //! JSON is produced and parsed by hand because the only permitted new
 //! dependency is `dirs`: the on-disk schema is a fixed versioned shape, so a
 //! small focused parser is testable and dependency-free.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::collect::types::{state_of_health_pct, BatterySample};
@@ -28,6 +32,24 @@ pub const MAX_BUCKETS: usize = RETENTION_MINUTES as usize + 480;
 
 /// On-disk schema version. A mismatch is treated as a corrupt file.
 const SCHEMA_VERSION: f64 = 1.0;
+
+/// Why a persisted history file could not be loaded, and where the
+/// unreadable bytes were preserved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadError {
+    pub message: String,
+    /// The unreadable file was renamed here (same directory, `.corrupt`
+    /// suffix). It is never deleted and never overwritten in place.
+    pub backup_path: PathBuf,
+}
+
+/// Outcome of [`HistoryStore::load`]: the store to start from, plus a
+/// non-fatal load failure to surface when the existing file was unreadable.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadResult {
+    pub store: HistoryStore,
+    pub load_error: Option<LoadError>,
+}
 
 /// One 1-minute bucket. Sums + counts per metric so means survive
 /// partially-populated samples (a missing metric never poisons the mean).
@@ -243,20 +265,67 @@ impl HistoryStore {
         Ok(HistoryStore { buckets })
     }
 
-    /// Load from disk. A missing or unreadable file yields an empty store.
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text).unwrap_or_default(),
-            Err(_) => HistoryStore::default(),
+    /// Load from disk. A missing file yields an empty store; a file that
+    /// cannot be read or parsed starts fresh too, but is first moved aside
+    /// to `<name>.corrupt` (kept, never deleted) and the failure reported so
+    /// the UI can surface it — a silently discarded history looks identical
+    /// to a never-recorded one.
+    pub fn load(path: &Path) -> LoadResult {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // First run (or no data dir yet): the normal fresh start.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return LoadResult {
+                    store: HistoryStore::default(),
+                    load_error: None,
+                };
+            }
+            // Present but unreadable (permissions, I/O error).
+            Err(e) => {
+                return Self::fresh_after_load_failure(path, format!("read: {e}"));
+            }
+        };
+        match Self::from_json(&text) {
+            Ok(store) => LoadResult {
+                store,
+                load_error: None,
+            },
+            Err(e) => Self::fresh_after_load_failure(path, format!("parse: {e}")),
         }
     }
 
-    /// Rewrite the store to disk after each new bucket.
+    /// Start fresh after an unreadable file: preserve the bytes (M2) and
+    /// report the reason to the caller for the dashboard notice.
+    fn fresh_after_load_failure(path: &Path, message: String) -> LoadResult {
+        LoadResult {
+            store: HistoryStore::default(),
+            load_error: Some(quarantine(path, message)),
+        }
+    }
+
+    /// Atomically rewrite the store to disk: serialize into a temp file in
+    /// the same directory, fsync it, then rename over the target. A crash
+    /// mid-write leaves the previous checkpoint intact (rename is atomic on
+    /// POSIX and, via `MOVEFILE_REPLACE_EXISTING`, on Windows).
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
         }
-        std::fs::write(path, self.to_json()).map_err(|e| format!("write history: {e}"))
+        let tmp = temp_sibling(path);
+        let write = (|| {
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create temp: {e}"))?;
+            f.write_all(self.to_json().as_bytes())
+                .map_err(|e| format!("write history: {e}"))?;
+            f.sync_all().map_err(|e| format!("fsync history: {e}"))
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("atomic rename: {e}")
+        })
     }
 
     /// Full retained window as CSV: charge%, SoH, temperature, power, cycles.
@@ -277,6 +346,46 @@ impl HistoryStore {
             ));
         }
         out
+    }
+}
+
+/// Sibling temp path for an atomic write: same directory as `path` so the
+/// final rename never crosses a filesystem boundary.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "history.json".to_string());
+    path.with_file_name(format!("{name}.tmp"))
+}
+
+/// Move an unreadable history file aside to `<name>.corrupt`, preserving its
+/// bytes. An earlier backup is never overwritten in place — the first
+/// collision takes `<name>.corrupt.1`, then `.2`, … — so a run of bad
+/// checkpoints keeps every one of them.
+fn quarantine(path: &Path, message: String) -> LoadError {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "history.json".to_string());
+    let mut backup = path.with_file_name(format!("{name}.corrupt"));
+    let mut n = 0u32;
+    while backup.exists() {
+        n += 1;
+        backup = path.with_file_name(format!("{name}.corrupt.{n}"));
+    }
+    match std::fs::rename(path, &backup) {
+        Ok(()) => LoadError {
+            message,
+            backup_path: backup,
+        },
+        // The unreadable bytes stay in place; the surfaced error says so.
+        // The next atomic save will still replace the file, but the user has
+        // been told the history could not be read and why.
+        Err(e) => LoadError {
+            message: format!("{message}; could not preserve a backup: {e}"),
+            backup_path: backup,
+        },
     }
 }
 
@@ -448,20 +557,65 @@ mod tests {
         store.save(&path).expect("save");
 
         let loaded = HistoryStore::load(&path);
-        assert_eq!(loaded, store);
-        assert_eq!(loaded.buckets[0].soc_mean(), Some(41.5));
+        assert_eq!(loaded.load_error, None);
+        assert_eq!(loaded.store, store);
+        assert_eq!(loaded.store.buckets[0].soc_mean(), Some(41.5));
 
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn corrupt_or_missing_file_starts_fresh() {
-        let corrupt = temp_file("corrupt");
-        std::fs::write(&corrupt, "{\"version\":1,\"buckets\":[[not json").unwrap();
-        assert!(HistoryStore::load(&corrupt).buckets.is_empty());
+    fn atomic_save_leaves_no_temp_file_behind() {
+        let path = temp_file("atomic");
+        let mut store = HistoryStore::default();
+        store.push(&sample(41.5, Some(28.0)), MIN0);
+        store.save(&path).expect("save");
+        // The temp sibling is consumed by the rename, both on first write and
+        // when replacing an existing checkpoint.
+        store.push(&sample(42.5, Some(29.0)), MIN0 + 60);
+        store.save(&path).expect("save again");
+        let mut files: Vec<_> = path
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        files.sort();
+        assert_eq!(files, vec![std::ffi::OsString::from("history.json")]);
+        // And the surviving file is the fully-written one.
+        assert!(HistoryStore::load(&path).load_error.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
 
+    #[test]
+    fn corrupt_file_preserved_as_corrupt_and_store_starts_fresh() {
+        let path = temp_file("corrupt-preserved");
+        std::fs::write(&path, "{\"version\":1,\"buckets\":[[not json").unwrap();
+        let result = HistoryStore::load(&path);
+        assert!(result.store.buckets.is_empty());
+        let err = result.load_error.expect("load error surfaced");
+        assert!(err.message.contains("parse"), "{}", err.message);
+        // The unreadable bytes were moved aside intact, not deleted.
+        assert!(err.backup_path.exists());
+        let preserved = std::fs::read_to_string(&err.backup_path).unwrap();
+        assert_eq!(preserved, "{\"version\":1,\"buckets\":[[not json");
+        assert!(!path.exists());
+        // A second corrupt checkpoint never overwrites the first backup.
+        std::fs::write(&path, "still not json").unwrap();
+        let second = HistoryStore::load(&path);
+        let second = second.load_error.expect("second load error");
+        assert_ne!(second.backup_path, err.backup_path);
+        assert!(err.backup_path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn missing_file_loads_fresh_without_error() {
         let missing = temp_file("missing-dir").join("nope").join("history.json");
-        assert!(HistoryStore::load(&missing).buckets.is_empty());
+        let result = HistoryStore::load(&missing);
+        assert!(result.store.buckets.is_empty());
+        assert_eq!(result.load_error, None);
     }
 
     #[test]
