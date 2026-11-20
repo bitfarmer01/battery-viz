@@ -8,7 +8,6 @@ license = "MIT"
 [dependencies]
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 egui_plot = "0.29"
-serde = { version = "1", features = ["derive"] }
 plist = "1"
 crossbeam-channel = "0.5"
 dirs = "5"

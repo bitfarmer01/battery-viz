@@ -6,7 +6,7 @@
 //! parameters are excluded and the weights renormalized, with the coverage
 //! reported alongside the score.
 
-use crate::collect::types::{state_of_health_pct, BatterySample, ChargingState};
+use crate::collect::types::{state_of_health_pct, BatterySample, ChargingState, SourceKind};
 
 pub mod weights {
     pub const SOH: f64 = 0.30;
@@ -139,8 +139,9 @@ fn score_cycles(s: &BatterySample) -> Option<ParameterScore> {
     })
 }
 
-/// Charge rate: power normalized against a 1C estimate from capacity and
-/// design voltage; only meaningful while charging.
+/// Charge rate: charging power divided by full-charge ENERGY in Wh
+/// (units normalized before any division — see the audit's H3 finding);
+/// only meaningful while charging.
 fn score_charge_rate(s: &BatterySample) -> Option<ParameterScore> {
     if s.charging_state != Some(ChargingState::Charging) {
         return None; // Not applicable while discharging; excluded from score.
@@ -149,12 +150,22 @@ fn score_charge_rate(s: &BatterySample) -> Option<ParameterScore> {
     if watts <= 0.0 {
         return None;
     }
-    let voltage_v = s.design_voltage_mv.or(s.voltage_mv)? / 1000.0;
-    let capacity_ah = s.full_charge_capacity? / 1000.0 / voltage_v.max(1.0);
-    if capacity_ah <= 0.0 {
+    // Full-charge capacity arrives in per-platform units (mAh on macOS,
+    // mWh on Windows); normalize to watt-hours BEFORE any division so the
+    // C-rate is W / Wh and never watts over amp-hours.
+    let capacity_wh = match s.source {
+        SourceKind::MacIoreg | SourceKind::MacSystemProfiler => {
+            // mAh -> Wh needs the pack voltage.
+            let v = s.voltage_mv? / 1000.0;
+            s.full_charge_capacity? * v / 1000.0
+        }
+        // Windows WMI and the simulator report milliwatt-hours.
+        _ => s.full_charge_capacity? / 1000.0,
+    };
+    if capacity_wh <= 0.0 {
         return None;
     }
-    let c_rate = watts / (capacity_ah * voltage_v);
+    let c_rate = watts / capacity_wh;
     // 0.5C → 100, 1C → 85, 2C → 0.
     let score = clamp100(100.0 - (c_rate - 0.5) * 60.0);
     Some(ParameterScore {
@@ -252,10 +263,40 @@ mod tests {
         assert!((r.coverage - 0.90).abs() < 1e-9);
 
         s.charging_state = Some(ChargingState::Charging);
-        s.power_w = Some(-30.0); // fast charge
+        s.power_w = Some(-24.0); // fast charge
         let r2 = evaluate(&s);
         let rate = r2.parameters.iter().find(|p| p.name == "Charge rate").unwrap();
         assert!(rate.score < 100.0);
+    }
+
+    #[test]
+    fn charge_rate_normalizes_capacity_to_wh_before_dividing() {
+        // Audit H3 regression: the old code divided mAh (or mWh) capacity
+        // by volts and then multiplied by volts again, mixing charge and
+        // energy units. full_sample reports 47_500 mWh = 47.5 Wh; 24 W /
+        // 47.5 Wh ≈ 0.505C.
+        let mut s = full_sample();
+        s.charging_state = Some(ChargingState::Charging);
+        s.power_w = Some(-24.0);
+        let r = evaluate(&s);
+        let rate = r
+            .parameters
+            .iter()
+            .find(|p| p.name == "Charge rate")
+            .unwrap();
+        assert_eq!(rate.detail, "Charging at 24.0 W ≈ 0.51C");
+
+        // Same watts against a Mac-style mAh capacity must NOT reuse the
+        // mWh math: 48_000 mAh at 12 V = 576 Wh -> 24/576 ≈ 0.04C.
+        s.source = SourceKind::MacIoreg;
+        s.voltage_mv = Some(12_000.0);
+        let r2 = evaluate(&s);
+        let rate2 = r2
+            .parameters
+            .iter()
+            .find(|p| p.name == "Charge rate")
+            .unwrap();
+        assert_eq!(rate2.detail, "Charging at 24.0 W ≈ 0.04C");
     }
 
     #[test]

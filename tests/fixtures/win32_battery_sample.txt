@@ -1,0 +1,18 @@
+# Audit finding M4 fixture — Win32_Battery fields.
+#
+# SYNTHETIC, LABELED AS SUCH: no real Windows machine is available in the
+# sandbox, so no genuine `Get-CimInstance Win32_Battery` (or in-process WMI
+# query) output could be captured here. The values follow the documented
+# Win32_Battery property semantics on Microsoft Learn (retrieved 2026-11-20):
+#   - DesignCapacity / FullChargeCapacity: milliwatt-hours (0 = unsupported)
+#   - DesignVoltage: millivolts
+#   - EstimatedChargeRemaining: percent
+#   - BatteryStatus: ENUMERATED code, not a bitfield
+#     (1 discharging, 2 on AC not necessarily charging, 3 fully charged,
+#      6-9 charging variants, 11 partially charged)
+# The values are realistic magnitudes for a 14" laptop pack.
+DesignCapacity: 60000
+FullChargeCapacity: 48000
+DesignVoltage: 11400
+EstimatedChargeRemaining: 65
+BatteryStatus: 2
