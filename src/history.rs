@@ -333,30 +333,9 @@ impl HistoryStore {
             load_error: Some(quarantine(path, message)),
         }
     }
-
-    /// Atomically rewrite the store to disk: serialize into a temp file in
-    /// the same directory, fsync it, then rename over the target. A crash
-    /// mid-write leaves the previous checkpoint intact (rename is atomic on
-    /// POSIX and, via `MOVEFILE_REPLACE_EXISTING`, on Windows).
+    /// Atomically rewrite the store to disk (see [`atomic_write`]).
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
-        }
-        let tmp = temp_sibling(path);
-        let write = (|| {
-            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create temp: {e}"))?;
-            f.write_all(self.to_json().as_bytes())
-                .map_err(|e| format!("write history: {e}"))?;
-            f.sync_all().map_err(|e| format!("fsync history: {e}"))
-        })();
-        if let Err(e) = write {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("atomic rename: {e}")
-        })
+        atomic_write(path, self.to_json().as_bytes())
     }
 
     /// Full retained window as CSV: charge%, SoH, temperature, power, cycles.
@@ -388,6 +367,31 @@ fn temp_sibling(path: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "history.json".to_string());
     path.with_file_name(format!("{name}.tmp"))
+}
+
+/// Write `contents` to `path` atomically: serialize into a temp file in the
+/// same directory, fsync it, then rename over the target. A crash mid-write
+/// leaves the previous file intact (rename is atomic on POSIX and, via
+/// `MOVEFILE_REPLACE_EXISTING`, on Windows). Shared by every persisted store
+/// so no state file can be left half-written.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
+    }
+    let tmp = temp_sibling(path);
+    let write = (|| {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create temp: {e}"))?;
+        f.write_all(contents).map_err(|e| format!("write: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync: {e}"))
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("atomic rename: {e}")
+    })
 }
 
 /// Move an unreadable history file aside to `<name>.corrupt`, preserving its
