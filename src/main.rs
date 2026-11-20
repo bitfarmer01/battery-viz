@@ -8,6 +8,7 @@
 mod alert;
 mod app;
 mod benchmark;
+mod caps;
 mod clock;
 mod collect;
 mod history;
@@ -17,7 +18,7 @@ mod ui;
 use eframe::egui::ViewportBuilder;
 
 fn main() -> eframe::Result<()> {
-    let rx = collect::spawn_collector(collect::platform_default());
+    let rx = collect::spawn_collector(caps::platform_collector());
 
     // Menu-bar agent mode: hidden at launch. `BATTERY_VIZ_START_HIDDEN`
     // forces the same state on dev platforms (used for RSS measurement).
