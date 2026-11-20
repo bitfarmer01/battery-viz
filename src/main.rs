@@ -11,6 +11,7 @@ mod benchmark;
 mod caps;
 mod clock;
 mod collect;
+mod dwell;
 mod history;
 mod notify;
 mod ui;

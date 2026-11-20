@@ -89,8 +89,6 @@ fn score_soc_band(s: &BatterySample) -> Option<ParameterScore> {
         100.0
     } else if soc > 80.0 {
         clamp100(100.0 - (soc - 80.0) * 3.0)
-    } else if soc < 20.0 {
-        clamp100(100.0 - (20.0 - soc) * 4.0)
     } else {
         clamp100(100.0 - (20.0 - soc) * 4.0)
     };
@@ -102,15 +100,22 @@ fn score_soc_band(s: &BatterySample) -> Option<ParameterScore> {
     })
 }
 
-/// High-SoC dwell: session time at ≥95% charge, decayed; unknown when not tracked.
+/// High-SoC dwell: accumulated time at or above the 80% threshold while
+/// plugged in (tracked by the app from the sample stream, audit H4), decayed;
+/// unknown when never tracked.
 fn score_high_dwell(s: &BatterySample) -> Option<ParameterScore> {
     let dwell_s = s.high_soc_dwell_s?;
-    // 0 s → 100; every 30 min at ≥95% costs ~8 points, floor at 20.
+    // 0 s → 100; every 30 min at or above the threshold costs ~8 points,
+    // floor at 20.
     let score = clamp100(100.0 - (dwell_s / 1800.0) * 8.0).max(20.0);
     let detail = if dwell_s < 60.0 {
         "Not parked at high charge".to_string()
     } else {
-        format!("{:.0} min at ≥95% charge this session", dwell_s / 60.0)
+        format!(
+            "{:.0} min at or above {:.0}% charge",
+            dwell_s / 60.0,
+            crate::dwell::DWELL_SOC_PCT
+        )
     };
     Some(ParameterScore {
         name: "High-charge dwell",
@@ -268,5 +273,37 @@ mod tests {
         assert_eq!(grade(80.0), "Healthy");
         assert_eq!(grade(60.0), "Aging");
         assert_eq!(grade(30.0), "Stressed");
+    }
+
+    #[test]
+    fn high_charge_dwell_factor_responds_to_accumulated_value() {
+        // Never tracked (None): the factor is excluded and its weight
+        // renormalizes away — missing data never silently helps.
+        let mut s = full_sample();
+        s.high_soc_dwell_s = None;
+        let r = evaluate(&s);
+        assert!(!r.parameters.iter().any(|p| p.name == "High-charge dwell"));
+        assert!((r.coverage - 0.75).abs() < 1e-9);
+
+        // Just tracked, zero dwell: included at a perfect score.
+        s.high_soc_dwell_s = Some(0.0);
+        let r0 = evaluate(&s);
+        let factor = r0
+            .parameters
+            .iter()
+            .find(|p| p.name == "High-charge dwell")
+            .unwrap();
+        assert_eq!(factor.score, 100.0);
+
+        // 30 qualifying minutes drops the factor ~8 points.
+        s.high_soc_dwell_s = Some(1800.0);
+        let r30 = evaluate(&s);
+        let factor30 = r30
+            .parameters
+            .iter()
+            .find(|p| p.name == "High-charge dwell")
+            .unwrap();
+        assert!(factor30.score < factor.score, "dwell must cost points");
+        assert!((factor30.score - 92.0).abs() < 1e-9, "{}", factor30.score);
     }
 }
