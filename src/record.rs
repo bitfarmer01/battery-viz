@@ -27,10 +27,12 @@ use crate::history::LoadError;
 
 /// A sample counts as "at high charge" at this state of charge or above —
 /// the top of the longevity band the scorecard and coaching use (80%).
-pub const HIGH_CHARGE_SOC_PCT: f64 = 80.0;
+/// Re-exported, not re-declared: the daily record must track the H4 dwell
+/// convention by construction, never by a copied constant.
+pub use crate::dwell::DWELL_SOC_PCT as HIGH_CHARGE_SOC_PCT;
 /// A sample counts as a warm hour at this pack temperature or above
 /// (degrees Celsius) — the same "warm" floor FR-4 counts weekly.
-pub const WARM_TEMP_C: f64 = 30.0;
+pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
 
 /// Hard cap on stored days: ten years plus margin. Daily rows are kept
 /// "indefinitely" in practice — the cap exists so the file stays bounded
@@ -118,21 +120,20 @@ impl DailyRecord {
     /// Fold one sample into its day row. Returns true when a new row was
     /// created (a checkpoint trigger, like the history store's).
     pub fn fold(&mut self, s: &BatterySample, day: u32) -> bool {
-        let created = match self.rows.last() {
-            Some(row) if row.day == day => false,
-            _ => {
+        // One row per day, ever: a clock that revisits an already-recorded
+        // day (timezone change, NTP step back then forward) folds into that
+        // row — a duplicate would split the day's samples silently and
+        // permanently, both rows serializing to disk.
+        let (idx, created) = match self.rows.binary_search_by_key(&day, |r| r.day) {
+            Ok(i) => (i, false),
+            Err(i) => {
                 // A clock step backwards lands out of order; keep the rows
                 // sorted by day regardless.
-                let idx = self.rows.partition_point(|r| r.day < day);
-                self.rows.insert(idx, DailyRow::new(day));
-                true
+                self.rows.insert(i, DailyRow::new(day));
+                (i, true)
             }
         };
-        let row = self
-            .rows
-            .iter_mut()
-            .find(|r| r.day == day)
-            .expect("day row exists after insert/match");
+        let row = &mut self.rows[idx];
         row.n += 1;
         if let Some(v) = state_of_health_pct(s) {
             row.soh_sum += v;
@@ -386,6 +387,22 @@ mod tests {
         assert!(rec.fold(&sample(50.0, None), 99));
         let days: Vec<u32> = rec.rows.iter().map(|r| r.day).collect();
         assert_eq!(days, vec![98, 99, 100]);
+    }
+
+    #[test]
+    fn revisiting_a_recorded_day_folds_into_it_never_duplicates() {
+        // Clock moves back across a recorded day, then forward onto it
+        // again (timezone change, NTP correction): the day must keep ONE
+        // row, folding the late sample in — a duplicate row would split
+        // the day's samples silently and permanently on disk.
+        let mut rec = DailyRecord::default();
+        assert!(rec.fold(&sample(90.0, None), 100));
+        assert!(rec.fold(&sample(50.0, None), 99));
+        assert!(!rec.fold(&sample(88.0, None), 100));
+        assert_eq!(rec.rows.len(), 2, "no duplicate row for day 100");
+        assert_eq!(rec.rows[1].day, 100);
+        assert_eq!(rec.rows[1].n, 2, "both day-100 samples in one row");
+        assert_eq!(rec.rows[0].day, 99);
     }
 
     #[test]

@@ -59,6 +59,11 @@ pub struct App {
     record_path: Option<PathBuf>,
     /// Sticky dashboard notice: the persisted record could not be read.
     pub record_load_error: Option<String>,
+    /// First-run capacity seed, still running in the background (Windows:
+    /// powercfg /batteryreport). `None` when there is nothing to wait for —
+    /// record not empty, no data dir, or the seed already applied.
+    pending_record_seed:
+        Option<(std::sync::mpsc::Receiver<Vec<crate::caps::SeedCapacity>>, PathBuf)>,
     /// New minute-buckets folded in since the last on-disk checkpoint (M1).
     buckets_since_save: u32,
     /// Monotonic time of the last dwell-accumulated sample (audit H4);
@@ -174,7 +179,7 @@ impl App {
         });
         // The daily record (FR-7) lives next to the history file, same data
         // dir, so the uninstall listing covers both with one deletion.
-        let (daily_record, record_path, record_load_error, record_seed_error) = match &history_path
+        let (daily_record, record_path, record_load_error, pending_record_seed) = match &history_path
         {
             Some(path) => {
                 let record_path = path.with_file_name("daily-record.json");
@@ -186,23 +191,27 @@ impl App {
                         e.backup_path.display()
                     )
                 });
-                let mut record = record_load.record;
+                let record = record_load.record;
                 // First run: seed from capacity history the machine already
                 // holds, asked through the capability adapter (Windows:
-                // powercfg /batteryreport). An empty answer — the adapter's
-                // explicit "unavailable" — leaves the record empty; nothing
-                // is invented.
-                let mut record_seed_error = None;
-                if record.rows.is_empty() {
-                    let seeds = crate::caps::platform_capabilities().capacity_seed();
-                    if !seeds.is_empty() {
-                        record.seed(&seeds);
-                        if let Err(e) = record.save(&record_path) {
-                            record_seed_error = Some(e);
-                        }
-                    }
-                }
-                (record, Some(record_path), record_load_error, record_seed_error)
+                // powercfg /batteryreport). The Windows answer needs a
+                // subprocess that can take seconds, so it runs on a
+                // background thread and is applied whenever it lands
+                // (`poll_record_seed` on a later frame) — window creation
+                // must not stall on first run. Until then — or when the
+                // adapter reports nothing — the record is simply empty;
+                // nothing is invented.
+                let pending_record_seed = if record.rows.is_empty() {
+                    let record_path = record_path.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::caps::platform_capabilities().capacity_seed());
+                    });
+                    Some((rx, record_path))
+                } else {
+                    None
+                };
+                (record, Some(record_path), record_load_error, pending_record_seed)
             }
             None => (DailyRecord::default(), None, None, None),
         };
@@ -244,7 +253,8 @@ impl App {
             advice_state_path,
             daily_record,
             record_path,
-            record_load_error: record_load_error.or(record_seed_error),
+            record_load_error,
+            pending_record_seed,
             buckets_since_save: 0,
             dwell_prev_s: None,
             last_error: None,
@@ -269,9 +279,41 @@ impl App {
         app
     }
 
+    /// Apply the deferred first-run capacity seed when the background
+    /// report lands. A cheap no-op on every frame until then; the
+    /// adapter's empty answer (macOS / simulator have no report to ask)
+    /// leaves the record empty — nothing is invented.
+    fn poll_record_seed(&mut self) {
+        let Some((rx, record_path)) = &self.pending_record_seed else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(seeds) => {
+                let record_path = record_path.clone();
+                self.pending_record_seed = None;
+                // Real samples may have folded in while the report ran;
+                // seed() fills only days with no row, so nothing sampled
+                // is overwritten either way.
+                if !seeds.is_empty() {
+                    self.daily_record.seed(&seeds);
+                    if let Err(e) = self.daily_record.save(&record_path) {
+                        self.record_load_error =
+                            Some(format!("seeded daily record could not be saved ({e})"));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_record_seed = None;
+            }
+        }
+    }
+
     /// Drain pending samples (non-blocking) and refresh derived state.
     pub fn update(&mut self) {
         self.frames_rendered += 1;
+        // First-run capacity seed may have landed since the last frame.
+        self.poll_record_seed();
         // Surface any platform-notification failure observed since the last
         // tick (osascript / PowerShell / AUMID / tray build). Sticky: it
         // stays visible until the next failure replaces it.
