@@ -10,6 +10,7 @@ mod advice;
 mod alert;
 mod app;
 mod benchmark;
+mod capdetect;
 mod caps;
 mod clock;
 mod collect;

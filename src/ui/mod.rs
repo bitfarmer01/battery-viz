@@ -9,6 +9,7 @@ use egui_plot::{Line, Plot, PlotPoints};
 
 use crate::app::App;
 use crate::benchmark::{grade, BenchmarkResult};
+use crate::capdetect::{CapPromptAnswer, CapStatus};
 use crate::collect::types::{state_of_health_pct, ChargingState};
 
 pub struct Dashboard {
@@ -243,6 +244,9 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
         draw_full_charge_advice(ctx, app);
     }
 
+    // FR-1: the one-time charge-cap setup prompt, above the dashboard.
+    draw_cap_setup_prompt(ctx, app);
+
     egui::CentralPanel::default()
         .frame(
             egui::Frame::default()
@@ -439,6 +443,28 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
             "⚠ OS reports a battery condition — consider service.",
         );
     }
+
+    // FR-1: charge-cap detection status. Hidden = the adapter says the
+    // feature is unsupported here; the row disappears rather than showing
+    // noise (degrade-or-hide, never guess).
+    match app.cap_monitor.status() {
+        CapStatus::Hidden => {}
+        CapStatus::Undetermined => {
+            ui.add_space(4.0);
+            ui.weak("Charge cap: watching charging behaviour…");
+        }
+        CapStatus::Capped => {
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 130),
+                "🛡 Charge cap active — the pack is being held below full on AC.",
+            );
+        }
+        CapStatus::Uncapped => {
+            ui.add_space(4.0);
+            ui.weak("Charge cap: none detected.");
+        }
+    }
 }
 
 fn fmt_opt(v: Option<f64>, suffix: &str) -> String {
@@ -446,6 +472,55 @@ fn fmt_opt(v: Option<f64>, suffix: &str) -> String {
         Some(v) => format!("{v:.1}{suffix}"),
         None => "no data".into(),
     }
+}
+
+/// FR-1: the one-time setup prompt. Names the exact per-machine steps from
+/// the FR-0 adapter (macOS: the System Settings battery pane; Windows: the
+/// maker's tool). The app never changes the cap itself — it only points.
+fn draw_cap_setup_prompt(ctx: &egui::Context, app: &mut App) {
+    // One gate: the record says unanswered, the monitor has a verdict, and
+    // the adapter has meaningful steps to give — otherwise stay quiet.
+    if !app.cap_prompt_visible() {
+        return;
+    }
+    let Some(g) = app.charge_cap_guidance() else {
+        return;
+    };
+    egui::TopBottomPanel::top("cap_setup_prompt").show(ctx, |ui| {
+        ui.add_space(8.0);
+        ui.heading("🛡 Set a charge limit on this machine");
+        ui.add_space(2.0);
+        ui.label(
+            "Sitting at full charge ages this battery fastest. A charge cap \
+             holds the pack below full whenever it is plugged in — the single \
+             most effective setting you can change.",
+        );
+        ui.add_space(2.0);
+        ui.label(format!("On this machine: {} — {}", g.tool, g.steps));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            match g.url {
+                Some(url) => {
+                    if ui.button(format!("Open {}", g.tool)).clicked() {
+                        match crate::caps::open_guidance_url(url) {
+                            Ok(()) => app.answer_cap_prompt(CapPromptAnswer::Acted),
+                            Err(e) => app.last_error = Some(e),
+                        }
+                    }
+                }
+                None => {
+                    if ui.button("Got it — I'll set it").clicked() {
+                        app.answer_cap_prompt(CapPromptAnswer::Acted);
+                    }
+                }
+            }
+            if ui.button("Dismiss").clicked() {
+                app.answer_cap_prompt(CapPromptAnswer::Dismissed);
+            }
+            ui.weak("Shown once — we will not ask again.");
+        });
+        ui.add_space(8.0);
+    });
 }
 
 fn gauge(ui: &mut egui::Ui, label: &str, value: String) {

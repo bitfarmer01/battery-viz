@@ -9,7 +9,8 @@ use crossbeam_channel::Receiver;
 use crate::advice::{self, SettingAdvice};
 use crate::alert::{Alert, AlertEngine, ClockInput};
 use crate::benchmark::{self, BenchmarkResult};
-use crate::caps::MetricId;
+use crate::capdetect::{self, CapMonitor, CapPromptAnswer, PromptRecord};
+use crate::caps::{Capabilities, MetricId, SettingGuidance, SettingKind};
 use crate::clock;
 use crate::collect::CollectorResult;
 use crate::history::HistoryStore;
@@ -110,14 +111,21 @@ pub struct App {
     /// drained, but nothing is recorded or alerted — a live sampler must
     /// never re-write history mid-delete.
     sampler_stopped: bool,
-    /// FR-4 gate, read once from the FR-0 adapter: does this machine expose
-    /// a temperature reading at all? False — as on many Windows machines —
-    /// the whole heat digest hides itself; no heat UI is ever rendered.
+    // Features never sniff the platform; they ask the FR-0 adapter.
     temperature_available: bool,
+    /// FR-1: behavioural charge-cap detector, fed every sample.
+    pub cap_monitor: CapMonitor,
+    /// FR-1: one-time setup prompt record. Once answered it never resets,
+    /// so the prompt shows at most once per machine.
+    cap_prompt_record: PromptRecord,
+    /// Where the prompt record persists; `None` keeps it in memory only.
+    cap_prompt_path: Option<PathBuf>,
+    /// FR-0 adapter for this machine: detectability, guidance, maker.
+    /// Feature code asks it, never the OS directly.
+    capabilities: Box<dyn Capabilities>,
     /// Monotonic origin for the engine's injected clock.
     start: std::time::Instant,
 }
-
 /// Fixed-capacity ring of (time-seconds-since-start, sample) pairs.
 pub struct History {
     pub t: Vec<f64>,
@@ -274,6 +282,13 @@ impl App {
             .as_deref()
             .map(read_advice_shown)
             .unwrap_or((false, None));
+        // FR-1: one-time charge-cap setup prompt record, persisted next to
+        // the history store so "at most once ever" survives restarts.
+        let cap_prompt_path = history_path.as_ref().map(|p| capdetect::prompt_path_for(p));
+        let cap_prompt_record = capdetect::load_record(cap_prompt_path.as_deref());
+        // FR-0 adapter for this machine.
+        let capabilities = crate::caps::platform_capabilities();
+        let cap_monitor = CapMonitor::for_adapter(capabilities.as_ref());
         let mut app = App {
             rx,
             latest: None,
@@ -314,6 +329,10 @@ impl App {
             temperature_available: crate::caps::platform_capabilities()
                 .readable_metrics()
                 .contains(&MetricId::Temperature),
+            cap_monitor,
+            cap_prompt_record,
+            cap_prompt_path,
+            capabilities,
             start: std::time::Instant::now(),
         };
         app.recompute_full_charge_advice();
@@ -395,6 +414,7 @@ impl App {
             self.history_store.add_dwell(credit);
             self.dwell_prev_s = Some(now_s);
             self.record_daily(sample);
+            self.cap_monitor.observe(sample, crate::history::unix_now());
             self.tick_alerts(sample);
         }
         if let Some(mut sample) = samples.into_iter().last() {
@@ -472,6 +492,32 @@ impl App {
         match &self.history_path {
             Some(history) => crate::uninstall::artifacts_for(history),
             None => Vec::new(),
+        }
+    }
+
+    /// FR-1: should the one-time charge-cap setup prompt be on screen?
+    /// Hidden when the adapter has no guidance to give — there is nothing
+    /// meaningful to point at, so the app does not ask.
+    pub fn cap_prompt_visible(&self) -> bool {
+        capdetect::should_prompt(self.cap_monitor.status(), self.cap_prompt_record)
+            && self.capabilities.guidance(SettingKind::ChargeCap).is_some()
+    }
+
+    /// FR-1: the exact per-machine steps for setting a charge cap, from the
+    /// FR-0 adapter. `None` = nothing meaningful to point at.
+    pub fn charge_cap_guidance(&self) -> Option<SettingGuidance> {
+        self.capabilities.guidance(SettingKind::ChargeCap)
+    }
+
+    /// FR-1: record the user's answer; the prompt never shows again. A
+    /// failed persist surfaces in the header — never silent — and the next
+    /// launch re-asks rather than silently forgetting the prompt.
+    pub fn answer_cap_prompt(&mut self, answer: CapPromptAnswer) {
+        self.cap_prompt_record.answered = Some(answer);
+        if let Some(path) = &self.cap_prompt_path {
+            if let Err(e) = capdetect::save_record(path, self.cap_prompt_record) {
+                self.last_error = Some(e);
+            }
         }
     }
 
