@@ -137,6 +137,12 @@ fn mean(sum: f64, n: u32) -> Option<f64> {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HistoryStore {
     pub buckets: Vec<MinuteBucket>,
+    /// High-charge dwell total, seconds: time at or above 80% SoC while
+    /// plugged in, accumulated from the sample stream (audit H4) and
+    /// persisted so the benchmark factor survives restarts. `None` until the
+    /// first sample has been seen — an absent value is "never tracked", not
+    /// zero, so the scorecard keeps its missing-data exclusion.
+    pub dwell_s: Option<f64>,
 }
 
 impl HistoryStore {
@@ -162,6 +168,13 @@ impl HistoryStore {
         }
         self.prune(minute);
         created
+    }
+
+    /// Add qualifying dwell seconds to the persisted total. The first call
+    /// flips the value from "never tracked" to tracked (even at zero) — the
+    /// app calls this once per incoming sample.
+    pub fn add_dwell(&mut self, secs: f64) {
+        self.dwell_s = Some(self.dwell_s.unwrap_or(0.0) + secs);
     }
 
     /// Drop buckets older than the retention window, then enforce the hard cap.
@@ -201,7 +214,13 @@ impl HistoryStore {
                     .unwrap_or(f64::NAN)
             ));
         }
-        out.push_str("]}");
+        out.push(']');
+        // Optional trailing key (audit H4): written once dwell tracking has
+        // started. Absent means "never tracked" for older files.
+        if let Some(d) = self.dwell_s {
+            out.push_str(&format!(",\"dwell_s\":{d}"));
+        }
+        out.push('}');
         out
     }
 
@@ -261,8 +280,20 @@ impl HistoryStore {
             }
         }
         p.skip_ws();
+        // Dwell is an optional trailing key: files written before H4 do not
+        // carry it, and its absence must load — not quarantine — the store.
+        let mut dwell_s = None;
+        if p.eat(b',') {
+            p.expect_key("dwell_s")?;
+            let d = p.number()?;
+            if !d.is_finite() || d < 0.0 {
+                return Err(format!("invalid dwell seconds {d}"));
+            }
+            dwell_s = Some(d);
+        }
+        p.skip_ws();
         p.expect(b'}')?;
-        Ok(HistoryStore { buckets })
+        Ok(HistoryStore { buckets, dwell_s })
     }
 
     /// Load from disk. A missing file yields an empty store; a file that
@@ -643,6 +674,47 @@ mod tests {
         store.push(&sample(50.0, Some(30.0)), 0);
         assert_eq!(store.buckets.len(), MAX_BUCKETS);
         assert_eq!(store.buckets[0].minute, 500);
+    }
+
+    #[test]
+    fn dwell_total_survives_a_save_and_reload() {
+        let path = temp_file("dwell-reload");
+        let mut store = HistoryStore::default();
+        store.push(&sample(85.0, Some(30.0)), MIN0);
+        store.add_dwell(30.0);
+        store.add_dwell(90.0);
+        assert_eq!(store.dwell_s, Some(120.0));
+        store.save(&path).expect("save");
+
+        let loaded = HistoryStore::load(&path);
+        assert_eq!(loaded.load_error, None);
+        assert_eq!(loaded.store, store, "dwell total persisted across reload");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn pre_dwell_history_file_loads_as_never_tracked() {
+        // A v1 file written before H4 carries no dwell key: it must load with
+        // the store untouched, not be quarantined as corrupt.
+        let path = temp_file("pre-dwell");
+        let mut store = HistoryStore::default();
+        store.push(&sample(41.5, Some(28.0)), MIN0);
+        std::fs::write(&path, store.to_json()).unwrap();
+        assert!(!store.to_json().contains("dwell_s"));
+
+        let loaded = HistoryStore::load(&path);
+        assert_eq!(loaded.load_error, None);
+        assert_eq!(loaded.store.dwell_s, None, "absent key is never-tracked");
+        assert_eq!(loaded.store.buckets, store.buckets);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn add_dwell_marks_tracking_started_even_at_zero() {
+        let mut store = HistoryStore::default();
+        assert_eq!(store.dwell_s, None, "fresh store has never tracked");
+        store.add_dwell(0.0); // a sample arrived, but qualified for nothing
+        assert_eq!(store.dwell_s, Some(0.0));
     }
 
     #[test]

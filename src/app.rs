@@ -37,6 +37,9 @@ pub struct App {
     pub history_load_error: Option<String>,
     /// New minute-buckets folded in since the last on-disk checkpoint (M1).
     buckets_since_save: u32,
+    /// Monotonic time of the last dwell-accumulated sample (audit H4);
+    /// `None` until the first sample — a first-ever sample credits nothing.
+    dwell_prev_s: Option<f64>,
     pub last_error: Option<String>,
     /// Most recent platform-notification delivery failure (osascript /
     /// PowerShell / AUMID registration / tray build), shown in the header so
@@ -150,6 +153,7 @@ impl App {
             history_path,
             history_load_error,
             buckets_since_save: 0,
+            dwell_prev_s: None,
             last_error: None,
             last_notify_error: None,
             frames_rendered: 0,
@@ -197,9 +201,17 @@ impl App {
         for sample in &samples {
             self.history.push(sample);
             self.record_history(sample);
+            // Audit H4: fold the interval into the persisted high-charge
+            // dwell total, then stamp the accumulated value onto the sample
+            // that feeds the benchmark, the gauge, and the capability report.
+            let now_s = self.start.elapsed().as_secs_f64();
+            let credit = crate::dwell::dwell_credit(self.dwell_prev_s, now_s, sample);
+            self.history_store.add_dwell(credit);
+            self.dwell_prev_s = Some(now_s);
             self.tick_alerts(sample);
         }
-        if let Some(sample) = samples.into_iter().last() {
+        if let Some(mut sample) = samples.into_iter().last() {
+            sample.high_soc_dwell_s = self.history_store.dwell_s;
             self.benchmark = Some(benchmark::evaluate(&sample));
             self.latest = Some(sample);
         }
@@ -346,6 +358,88 @@ mod tests {
             state_of_charge: Some(soc),
             ..Default::default()
         }
+    }
+
+    fn sample_charging(soc: f64) -> crate::collect::BatterySample {
+        crate::collect::BatterySample {
+            state_of_charge: Some(soc),
+            charging_state: Some(crate::collect::types::ChargingState::Charging),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dwell_is_tracked_from_the_sample_stream_and_feeds_the_benchmark() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, None);
+
+        // A fresh app has never tracked dwell: the factor is excluded.
+        tx.send(Ok(sample(85.0))).unwrap();
+        app.update();
+        assert_eq!(app.history_store.dwell_s, Some(0.0), "tracking started");
+        let benchmark = app.benchmark.clone().expect("benchmark evaluated");
+        // Sub-1 Hz-frame gap may credit a hair, but the factor must exist and
+        // the stamped sample must carry the accumulated total.
+        assert!(benchmark
+            .parameters
+            .iter()
+            .any(|p| p.name == "High-charge dwell"));
+        let latest = app.latest.clone().expect("latest sample");
+        assert_eq!(latest.high_soc_dwell_s, app.history_store.dwell_s);
+
+        // Qualifying seconds (85% charging) accumulate into the store.
+        let before = app.history_store.dwell_s.unwrap_or(0.0);
+        for _ in 0..5 {
+            tx.send(Ok(sample_charging(85.0))).unwrap();
+            app.update();
+        }
+        assert!(
+            app.history_store.dwell_s.unwrap_or(0.0) >= before,
+            "dwell never decreases while samples qualify"
+        );
+        // The stamped benchmark sample carries the live total. (The size of
+        // the credit in a sub-second test run is nondeterministic — the exact
+        // accumulation math is pinned by the `dwell` module tests.)
+        let latest = app.latest.clone().expect("latest after qualifying run");
+        assert_eq!(latest.high_soc_dwell_s, app.history_store.dwell_s);
+    }
+
+    #[test]
+    fn dwell_total_survives_a_restart_through_the_history_store() {
+        let dir = tagged_dir("dwell-restart");
+        let path = dir.join("history.json");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, Some(path.clone()));
+
+        tx.send(Ok(sample_charging(90.0))).unwrap();
+        app.update();
+        app.history_store.add_dwell(600.0); // simulate ten qualifying minutes
+        app.save_history_now();
+
+        // A new app instance over the same data dir reloads the total.
+        let (_tx2, rx2) = crossbeam_channel::unbounded();
+        let reloaded = App::with_history_path(rx2, Some(path));
+        assert_eq!(reloaded.history_store.dwell_s, Some(600.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_app_excludes_the_dwell_factor_until_data_exists() {
+        // No samples yet: never tracked, factor excluded from the scorecard.
+        let app = app_at(None);
+        assert_eq!(app.history_store.dwell_s, None);
+        assert!(app.benchmark.is_none());
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, None);
+        tx.send(Ok(sample(50.0))).unwrap(); // below threshold, unplugged
+        app.update();
+        let benchmark = app.benchmark.clone().expect("benchmark after first sample");
+        assert!(benchmark
+            .parameters
+            .iter()
+            .any(|p| p.name == "High-charge dwell"));
+        assert_eq!(app.history_store.dwell_s, Some(0.0));
     }
 
     #[test]

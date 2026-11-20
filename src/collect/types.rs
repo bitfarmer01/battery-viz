@@ -28,7 +28,11 @@ pub struct BatterySample {
     pub power_w: Option<f64>,
     /// Charging state.
     pub charging_state: Option<ChargingState>,
-    /// Time the pack has spent at >= 95% state of charge, seconds (session-cumulative).
+    /// Time the pack has spent at or above 80% state of charge while plugged
+    /// in, seconds. No collector reports this: the app accumulates it from
+    /// the sample stream (audit H4, `dwell` module), persists it in the
+    /// history store, and stamps the running total onto the latest sample
+    /// before the benchmark evaluates it.
     pub high_soc_dwell_s: Option<f64>,
     /// Capacity design voltage, millivolts (Windows WMI DesignVoltage).
     pub design_voltage_mv: Option<f64>,
