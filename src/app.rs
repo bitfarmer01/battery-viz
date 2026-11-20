@@ -15,6 +15,7 @@ use crate::collect::CollectorResult;
 use crate::history::HistoryStore;
 use crate::notify;
 use crate::warm::{self, WarmHoursReport};
+use crate::record::DailyRecord;
 
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
@@ -50,6 +51,14 @@ pub struct App {
     /// Where the one-shot advice flag persists; `None` when no platform
     /// data dir exists (the card never shows).
     advice_state_path: Option<PathBuf>,
+    /// Long-term daily record (FR-7): one summary row per local day,
+    /// kept indefinitely within [`crate::record::MAX_DAYS`].
+    pub daily_record: DailyRecord,
+    /// Where the record persists; derived from the history path so tests
+    /// and the uninstall seam point at the same data dir.
+    record_path: Option<PathBuf>,
+    /// Sticky dashboard notice: the persisted record could not be read.
+    pub record_load_error: Option<String>,
     /// New minute-buckets folded in since the last on-disk checkpoint (M1).
     buckets_since_save: u32,
     /// Monotonic time of the last dwell-accumulated sample (audit H4);
@@ -163,6 +172,40 @@ impl App {
                 e.backup_path.display()
             )
         });
+        // The daily record (FR-7) lives next to the history file, same data
+        // dir, so the uninstall listing covers both with one deletion.
+        let (daily_record, record_path, record_load_error, record_seed_error) = match &history_path
+        {
+            Some(path) => {
+                let record_path = path.with_file_name("daily-record.json");
+                let record_load = DailyRecord::load(&record_path);
+                let record_load_error = record_load.load_error.as_ref().map(|e| {
+                    format!(
+                        "prior daily record could not be read ({}) — starting fresh; preserved at {}",
+                        e.message,
+                        e.backup_path.display()
+                    )
+                });
+                let mut record = record_load.record;
+                // First run: seed from capacity history the machine already
+                // holds, asked through the capability adapter (Windows:
+                // powercfg /batteryreport). An empty answer — the adapter's
+                // explicit "unavailable" — leaves the record empty; nothing
+                // is invented.
+                let mut record_seed_error = None;
+                if record.rows.is_empty() {
+                    let seeds = crate::caps::platform_capabilities().capacity_seed();
+                    if !seeds.is_empty() {
+                        record.seed(&seeds);
+                        if let Err(e) = record.save(&record_path) {
+                            record_seed_error = Some(e);
+                        }
+                    }
+                }
+                (record, Some(record_path), record_load_error, record_seed_error)
+            }
+            None => (DailyRecord::default(), None, None, None),
+        };
         // Menu-bar agent mode (macOS, or any host started hidden): the window
         // exists but is not shown at launch; the tray / `--hidden` toggles it.
         let start_hidden =
@@ -199,6 +242,9 @@ impl App {
             ),
             advice_shown,
             advice_state_path,
+            daily_record,
+            record_path,
+            record_load_error: record_load_error.or(record_seed_error),
             buckets_since_save: 0,
             dwell_prev_s: None,
             last_error: None,
@@ -261,6 +307,7 @@ impl App {
             let credit = crate::dwell::dwell_credit(self.dwell_prev_s, now_s, sample);
             self.history_store.add_dwell(credit);
             self.dwell_prev_s = Some(now_s);
+            self.record_daily(sample);
             self.tick_alerts(sample);
         }
         if let Some(mut sample) = samples.into_iter().last() {
@@ -389,6 +436,14 @@ impl App {
         }
     }
 
+    /// Fold a sample into the long-term daily record (FR-7): one summary
+    /// row per local day — capacity, cycles, hours at high charge, warm
+    /// hours — kept well past the 7-day 1-minute history window.
+    fn record_daily(&mut self, sample: &crate::collect::BatterySample) {
+        let day = clock::local_now().day;
+        self.daily_record.fold(sample, day);
+    }
+
     /// Count new buckets and checkpoint on the cadence boundary.
     fn checkpoint_history(&mut self, created_new_bucket: bool) {
         if !created_new_bucket {
@@ -413,6 +468,11 @@ impl App {
         self.buckets_since_save = 0;
         if let Some(path) = &self.history_path {
             if let Err(e) = self.history_store.save(path) {
+                self.last_error = Some(e);
+            }
+        }
+        if let Some(path) = &self.record_path {
+            if let Err(e) = self.daily_record.save(path) {
                 self.last_error = Some(e);
             }
         }
@@ -718,5 +778,61 @@ mod tests {
         assert_eq!(digest.warm_minutes, 1);
         assert_eq!(digest.covered_minutes, 2);
         assert_eq!(digest.warm_hours(), 1.0 / 60.0);
+    }
+
+    #[test]
+    fn daily_record_folds_samples_and_persists_with_history() {
+        let dir = tagged_dir("record");
+        let mut app = app_at(Some(dir.join("history.json")));
+
+        let mut s = sample(90.0);
+        s.temperature_c = Some(35.0);
+        s.design_capacity = Some(50_000.0);
+        s.full_charge_capacity = Some(45_000.0);
+        s.cycle_count = Some(300);
+        app.record_daily(&s);
+        assert_eq!(app.daily_record.rows.len(), 1);
+        assert!(app.daily_record.rows[0].high_n == 1 && app.daily_record.rows[0].warm_n == 1);
+
+        // The record checkpoints with the history store, next to it.
+        app.save_history_now();
+        let record_path = dir.join("daily-record.json");
+        assert!(record_path.exists(), "record persisted beside history");
+        let loaded = DailyRecord::load(&record_path);
+        assert_eq!(loaded.record, app.daily_record);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_record_starts_fresh_with_a_visible_notice() {
+        let dir = tagged_dir("record-notice");
+        let record_path = dir.join("daily-record.json");
+        std::fs::write(&record_path, "{").unwrap();
+        let app = app_at(Some(dir.join("history.json")));
+        assert!(app.daily_record.rows.is_empty(), "corrupt record starts fresh");
+        let notice = app
+            .record_load_error
+            .as_ref()
+            .expect("record load failure surfaced as a dashboard notice");
+        assert!(notice.contains("daily record"), "{notice}");
+        assert!(notice.contains("daily-record.json.corrupt"), "{notice}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uninstall_deletes_the_daily_record_too() {
+        let dir = tagged_dir("record-uninstall");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, Some(dir.join("history.json")));
+        app.record_daily(&sample(50.0));
+        app.save_history_now();
+        let record_path = dir.join("daily-record.json");
+        assert!(record_path.exists(), "record persisted before uninstall");
+
+        app.confirm_uninstall();
+        assert!(!record_path.exists(), "uninstall removes the daily record");
+        let results = app.uninstall_results.clone().expect("per-path results");
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        drop(tx);
     }
 }
