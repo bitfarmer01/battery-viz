@@ -4,7 +4,6 @@
 //! status top-right, per-parameter scorecard beneath, time-series plots at
 //! the bottom. Unknown telemetry renders as "no data", never as a good score.
 
-
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
@@ -16,7 +15,8 @@ pub struct Dashboard {
     app: App,
     /// Status line after the last CSV export (destination path or error).
     export_status: Option<String>,
-    /// macOS tray agent (menu: show dashboard / pause alerts / quit). `None`
+    /// macOS tray agent (menu: show dashboard / pause alerts / uninstall /
+    /// quit). `None`
     /// when the tray could not be built — the app degrades to banner-only
     /// alerting with the reason surfaced through the notify error sink,
     /// instead of aborting.
@@ -74,6 +74,17 @@ impl eframe::App for Dashboard {
         #[cfg(target_os = "macos")]
         self.handle_tray_commands(ctx);
 
+        // Finish-card Quit: end the process through eframe's normal teardown
+        // (on macOS the close-to-tray intercept yields because
+        // `quit_requested` is set first).
+        if self.app.quit_requested {
+            #[cfg(target_os = "macos")]
+            {
+                self.quit_requested = true;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         self.app.update();
 
         // Hidden (menu-bar agent) mode: the 1 Hz tick advances the engine and
@@ -101,6 +112,15 @@ impl Dashboard {
                     ctx.send_viewport_cmd(ViewportCommand::Focus);
                 }
                 TrayCommand::SetPaused(paused) => self.app.set_alerts_paused(paused),
+                // Uninstall opens the in-app confirm panel, so the agent must
+                // be visible to show it.
+                TrayCommand::Uninstall => {
+                    self.app.uninstall_requested = true;
+                    self.app.window_visible = true;
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(1280.0, 800.0)));
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
                 // Clean shutdown: request the viewport close and let eframe
                 // unwind normally (the hide-to-tray intercept yields because
                 // `quit_requested` is set).
@@ -126,11 +146,7 @@ fn score_color(v: f64) -> egui::Color32 {
     egui::Color32::from_rgb(r as u8, g as u8, 70)
 }
 
-fn draw(
-    ctx: &egui::Context,
-    app: &mut App,
-    export_status: &mut Option<String>,
-) {
+fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) {
     egui::TopBottomPanel::top("header").show(ctx, |ui| {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -169,12 +185,20 @@ fn draw(
                 ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
             ui.separator();
-            let pause_label = if app.alerts_paused { "▶ Resume alerts" } else { "⏸ Pause alerts" };
+            let pause_label = if app.alerts_paused {
+                "▶ Resume alerts"
+            } else {
+                "⏸ Pause alerts"
+            };
             if ui.button(pause_label).clicked() {
                 app.set_alerts_paused(!app.alerts_paused);
             }
             if app.alerts_paused {
                 ui.weak("alerts paused");
+            }
+            ui.separator();
+            if ui.button("Uninstall…").clicked() {
+                app.request_uninstall();
             }
         });
         ui.add_space(8.0);
@@ -219,6 +243,15 @@ fn draw(
                 draw_trends(ui, app, export_status);
             });
         });
+
+    // Modal uninstall flow, drawn above the dashboard. The finish card is
+    // checked first so the confirm panel never re-opens over it.
+    if app.uninstall_results.is_some() {
+        let results = app.uninstall_results.clone().unwrap_or_default();
+        draw_uninstall_finish(ctx, app, &results);
+    } else if app.uninstall_requested {
+        draw_uninstall_confirm(ctx, app);
+    }
 }
 
 fn draw_benchmark_ring(ui: &mut egui::Ui, result: Option<&BenchmarkResult>) {
@@ -234,10 +267,12 @@ fn draw_benchmark_ring(ui: &mut egui::Ui, result: Option<&BenchmarkResult>) {
     let radius = rect.size().min_elem() / 2.0 - 10.0;
 
     // Track + arc.
-    ui.painter()
-        .circle_stroke(center, radius, egui::Stroke::new(6.0_f32, egui::Color32::from_rgb(40, 44, 56)));
-    let sweep = (std::f64::consts::TAU as f32)
-        * ((total / 100.0).clamp(0.0, 1.0) as f32);
+    ui.painter().circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(6.0_f32, egui::Color32::from_rgb(40, 44, 56)),
+    );
+    let sweep = (std::f64::consts::TAU as f32) * ((total / 100.0).clamp(0.0, 1.0) as f32);
     let n_segments = 96;
     let points: Vec<egui::Pos2> = (0..=n_segments)
         .map(|i| {
@@ -253,7 +288,11 @@ fn draw_benchmark_ring(ui: &mut egui::Ui, result: Option<&BenchmarkResult>) {
     ui.painter().text(
         center,
         egui::Align2::CENTER_CENTER,
-        if result.is_some() { format!("{total:.0}") } else { "…".into() },
+        if result.is_some() {
+            format!("{total:.0}")
+        } else {
+            "…".into()
+        },
         egui::FontId::proportional(52.0),
         color,
     );
@@ -315,28 +354,59 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
         return;
     };
 
-    egui::Grid::new("gauges").num_columns(4).spacing([24.0, 6.0]).show(ui, |ui| {
-        gauge(ui, "Charge", fmt_opt(s.state_of_charge, "%"));
-        gauge(ui, "Health (SoH)", fmt_opt(state_of_health_pct(s), "%"));
-        gauge(ui, "Temperature", fmt_opt(s.temperature_c, "°C"));
-        gauge(ui, "Power", match s.power_w {
-            Some(w) if w < 0.0 => format!("−{:.1} W in", -w),
-            Some(w) => format!("{:.1} W out", w),
-            None => "no data".into(),
+    egui::Grid::new("gauges")
+        .num_columns(4)
+        .spacing([24.0, 6.0])
+        .show(ui, |ui| {
+            gauge(ui, "Charge", fmt_opt(s.state_of_charge, "%"));
+            gauge(ui, "Health (SoH)", fmt_opt(state_of_health_pct(s), "%"));
+            gauge(ui, "Temperature", fmt_opt(s.temperature_c, "°C"));
+            gauge(
+                ui,
+                "Power",
+                match s.power_w {
+                    Some(w) if w < 0.0 => format!("−{:.1} W in", -w),
+                    Some(w) => format!("{:.1} W out", w),
+                    None => "no data".into(),
+                },
+            );
+            ui.end_row();
+            gauge(
+                ui,
+                "Cycles",
+                s.cycle_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "no data".into()),
+            );
+            gauge(
+                ui,
+                "Cycle limit",
+                s.cycle_limit
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            );
+            gauge(
+                ui,
+                "Voltage",
+                fmt_opt(s.voltage_mv.map(|v| v / 1000.0), " V"),
+            );
+            gauge(
+                ui,
+                "High-charge dwell",
+                match s.high_soc_dwell_s {
+                    Some(sec) => format!("{:.0} min", sec / 60.0),
+                    None => "not tracked".into(),
+                },
+            );
+            ui.end_row();
         });
-        ui.end_row();
-        gauge(ui, "Cycles", s.cycle_count.map(|c| c.to_string()).unwrap_or_else(|| "no data".into()));
-        gauge(ui, "Cycle limit", s.cycle_limit.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into()));
-        gauge(ui, "Voltage", fmt_opt(s.voltage_mv.map(|v| v / 1000.0), " V"));
-        gauge(ui, "High-charge dwell", match s.high_soc_dwell_s {
-            Some(sec) => format!("{:.0} min", sec / 60.0),
-            None => "not tracked".into(),
-        });
-        ui.end_row();
-    });
 
     if s.condition_flags.iter().any(|f| {
-        matches!(f, crate::collect::ConditionFlag::ServiceRecommended | crate::collect::ConditionFlag::Failure)
+        matches!(
+            f,
+            crate::collect::ConditionFlag::ServiceRecommended
+                | crate::collect::ConditionFlag::Failure
+        )
     }) {
         ui.add_space(6.0);
         ui.colored_label(
@@ -447,8 +517,7 @@ fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>)
             .show_axes([false, true])
             .show(&mut cols[1], |plot| {
                 plot.line(
-                    Line::new(PlotPoints::from_iter(temp.iter().copied()))
-                        .color(score_color(75.0)),
+                    Line::new(PlotPoints::from_iter(temp.iter().copied())).color(score_color(75.0)),
                 );
             });
     });
@@ -464,4 +533,115 @@ fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>)
             ui.weak(egui::RichText::new(status.as_str()).small());
         }
     });
+}
+
+/// Modal confirm: what gets deleted (only paths that exist), what does not,
+/// and Cancel / Delete everything.
+fn draw_uninstall_confirm(ctx: &egui::Context, app: &mut App) {
+    let existing: Vec<String> = crate::uninstall::paths()
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+
+    egui::Window::new("Uninstall Battery Viz?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            if existing.is_empty() {
+                ui.weak("Nothing stored yet — there is no data to delete.");
+            } else {
+                ui.weak("This permanently deletes everything the app has stored:");
+                for path in &existing {
+                    ui.monospace(egui::RichText::new(format!("  {path}")).small());
+                }
+            }
+            ui.add_space(6.0);
+            ui.weak(
+                egui::RichText::new(
+                    "Not deleted: CSV exports you already saved elsewhere, and the app file \
+                     itself — the next step gives you a copy-paste command for it.",
+                )
+                .small(),
+            );
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if ui.button("Cancel").clicked() {
+                    app.cancel_uninstall();
+                }
+                let delete = ui.button(
+                    egui::RichText::new("Delete everything")
+                        .color(egui::Color32::from_rgb(235, 110, 90)),
+                );
+                if delete.clicked() {
+                    app.confirm_uninstall();
+                }
+            });
+        });
+}
+
+/// Modal finish card: per-path outcomes, the binary the app never deletes
+/// itself, and a copyable command for the person to run. No auto-quit — the
+/// person reads the card first.
+fn draw_uninstall_finish(
+    ctx: &egui::Context,
+    app: &mut App,
+    results: &[Result<std::path::PathBuf, String>],
+) {
+    let all_deleted = results.iter().all(Result::is_ok);
+
+    egui::Window::new("Uninstall — what happened")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.add_space(4.0);
+            if all_deleted {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 200, 120),
+                    "✅ All stored data deleted.",
+                );
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 110, 90),
+                    "⚠ Some deletions failed:",
+                );
+            }
+            for result in results {
+                match result {
+                    Ok(path) => {
+                        ui.monospace(format!("✅ deleted {}", path.display()));
+                    }
+                    Err(e) => {
+                        ui.monospace(format!("❌ {e}"));
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.weak(
+                "The app itself was never deleted (a running program must not remove its own \
+                 file). Finish by running this:",
+            );
+            let exe = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<app binary>".to_string());
+            ui.monospace(&exe);
+            let command = crate::uninstall::removal_command(&exe);
+            ui.horizontal(|ui| {
+                if ui.button("Copy removal command").clicked() {
+                    ui.output_mut(|o| o.copied_text = command.clone());
+                    app.uninstall_command_copied = true;
+                }
+                if app.uninstall_command_copied {
+                    ui.weak("Copied ✓");
+                }
+            });
+            ui.weak(egui::RichText::new(command.as_str()).small());
+            ui.add_space(10.0);
+            if ui.button("Quit Battery Viz").clicked() {
+                app.quit_requested = true;
+            }
+        });
 }

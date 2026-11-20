@@ -17,6 +17,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 pub enum TrayCommand {
     ShowDashboard,
     SetPaused(bool),
+    Uninstall,
     Quit,
 }
 
@@ -24,6 +25,7 @@ pub struct MacosTray {
     _tray: TrayIcon,
     show_item: MenuItem,
     pause_item: CheckMenuItem,
+    uninstall_item: MenuItem,
     quit_item: MenuItem,
 }
 
@@ -35,9 +37,10 @@ impl MacosTray {
     pub fn new(paused: bool) -> Result<Self, String> {
         let show_item = MenuItem::new("Show Dashboard", true, None);
         let pause_item = CheckMenuItem::new("Pause Alerts", true, paused, None);
+        let uninstall_item = MenuItem::new("Uninstall…", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
-        let _ = menu.append_items(&[&show_item, &pause_item, &quit_item]);
+        let _ = menu.append_items(&[&show_item, &pause_item, &uninstall_item, &quit_item]);
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -46,7 +49,13 @@ impl MacosTray {
             .build()
             .map_err(|e| format!("build tray icon: {e}"))?;
 
-        Ok(MacosTray { _tray: tray, show_item, pause_item, quit_item })
+        Ok(MacosTray {
+            _tray: tray,
+            show_item,
+            pause_item,
+            uninstall_item,
+            quit_item,
+        })
     }
 
     /// Drain ALL pending menu events — clicks that arrive within one wake
@@ -59,6 +68,8 @@ impl MacosTray {
                 commands.push(TrayCommand::ShowDashboard);
             } else if event.id == self.pause_item.id() {
                 commands.push(TrayCommand::SetPaused(self.pause_item.is_checked()));
+            } else if event.id == self.uninstall_item.id() {
+                commands.push(TrayCommand::Uninstall);
             } else if event.id == self.quit_item.id() {
                 commands.push(TrayCommand::Quit);
             }
@@ -79,13 +90,19 @@ pub fn send_notification(title: &str, body: &str) {
     );
     std::thread::Builder::new()
         .name("notify-osascript".into())
-        .spawn(move || match std::process::Command::new("osascript").args(["-e", &script]).status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => crate::notify::record_notify_error(format!(
-                "osascript notification failed (exit {status})"
-            )),
-            Err(e) => crate::notify::record_notify_error(format!("osascript spawn failed: {e}")),
+        .spawn(move || {
+            match std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => crate::notify::record_notify_error(format!(
+                    "osascript notification failed (exit {status})"
+                )),
+                Err(e) => {
+                    crate::notify::record_notify_error(format!("osascript spawn failed: {e}"))
+                }
+            }
         })
         .ok();
 }
