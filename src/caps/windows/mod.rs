@@ -206,12 +206,16 @@ mod tests {
     #[test]
     fn declared_metrics_match_wmi_parse() {
         let caps = WindowsCapabilities::with_maker(Maker::Dell);
-        let out = "DesignCapacity         : 60000\n\
-                  FullChargeCapacity     : 48000\n\
-                  DesignVoltage          : 11400\n\
-                  EstimatedChargeRemaining : 65\n\
-                  BatteryStatus          : 2\n";
-        let s = crate::collect::windows::parse_wmi_output(out).expect("parse");
+        // Same Win32_Battery field values the old Format-List text parser
+        // test used, now fed through the in-process WMI decode path.
+        let raw = crate::collect::windows::RawWmiBattery {
+            design_capacity_mwh: Some(60000.0),
+            full_charge_capacity_mwh: Some(48000.0),
+            design_voltage_mv: Some(11400.0),
+            estimated_charge_remaining_pct: Some(65.0),
+            battery_status: Some(2),
+        };
+        let s = crate::collect::windows::build_sample(raw).expect("parse");
         for m in super::super::ALL_METRICS {
             assert_eq!(
                 m.is_present(&s),

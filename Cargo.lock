@@ -159,7 +159,6 @@ dependencies = [
  "eframe",
  "egui_plot",
  "plist",
- "serde",
  "tray-icon",
  "winit",
  "wmi",

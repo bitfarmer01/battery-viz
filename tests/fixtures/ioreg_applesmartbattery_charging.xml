@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Audit finding M4 fixture — provenance and labeling.
+
+  PROVENANCE: The field values below are transcribed from a REAL machine
+  capture: a MacBook Air (macOS 27.2), published 2026-10-13 in the
+  purplelink.llc guide "Check your Mac battery health, cycle count and
+  voltage without installing anything" (retrieved 2026-11-20). Charging
+  reading: Voltage 11845 mV, Amperage +738 mA, CurrentCapacity 55,
+  CycleCount 628, BatteryData DesignCapacity 4629 / NominalChargeCapacity
+  3976 / FullChargeCapacity 3849 mAh.
+
+  SYNTHESIZED WRAPPER: The sandbox has no Mac, so `ioreg -r -n
+  AppleSmartBattery -d 1 -a -x` could not be captured here. The XML plist
+  below reproduces the documented ioreg -a shape (array of dicts) around
+  the real values; BatteryData-nested values are surfaced at the top level
+  because the published capture's grep cut the root-level copies of those
+  keys. The source printed Amperage as an unsigned-wrapped 64-bit value
+  (18446744073709550201); the signed form +738 shown here is the value the
+  source itself recovers via bash arithmetic and plutil.
+-->
+<plist version="1.0">
+<array>
+  <dict>
+    <key>Voltage</key><integer>11845</integer>
+    <key>Amperage</key><integer>738</integer>
+    <key>CurrentCapacity</key><integer>55</integer>
+    <key>MaxCapacity</key><integer>100</integer>
+    <key>DesignCapacity</key><integer>4629</integer>
+    <key>NominalChargeCapacity</key><integer>3976</integer>
+    <key>FullChargeCapacity</key><integer>3849</integer>
+    <key>CycleCount</key><integer>628</integer>
+    <key>ExternalConnected</key><true/>
+    <key>IsCharging</key><true/>
+    <key>FullyCharged</key><false/>
+  </dict>
+</array>
+</plist>

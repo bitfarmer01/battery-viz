@@ -90,12 +90,15 @@ pub fn parse_ioreg_plist(xml: &[u8]) -> Result<BatterySample, String> {
         ChargingState::Discharging
     };
 
-    // Amperage (mA) x Voltage (mV) / 1e9 = kW; sign: negative while charging.
+    // Amperage (mA) x Voltage (mV) / 1e6 = W. ioreg signs the current
+    // itself — negative while the pack discharges, positive while it
+    // charges (real MacBook Air capture, published 2026-10-13) — which is
+    // the OPPOSITE of our sample convention (positive = discharging), so
+    // negate the product. Do not re-sign from `is_charging`: the same
+    // capture shows IsCharging stuck Yes while a weak adapter lets the
+    // pack drain.
     let power_w = match (get_f64("Amperage"), get_f64("Voltage")) {
-        (Some(ma), Some(mv)) => {
-            let w = ma * mv / 1.0e9;
-            Some(if is_charging { -w } else { w })
-        }
+        (Some(ma), Some(mv)) => Some(-(ma * mv / 1.0e6)),
         _ => None,
     };
 
@@ -144,6 +147,20 @@ pub fn parse_ioreg_plist(xml: &[u8]) -> Result<BatterySample, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Audit M4: parser fixtures. The sandbox has no Mac, so the XML plist
+    // wrappers here are SYNTHESIZED, but every field VALUE is transcribed
+    // from a real MacBook Air (macOS 27.2) ioreg capture published in the
+    // purplelink.llc battery guide (retrieved 2026-11-20). Each file
+    // carries its full provenance and caveats in a header comment.
+    const FIXTURE_CHARGING: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ioreg_applesmartbattery_charging.xml"
+    ));
+    const FIXTURE_DRAINING: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ioreg_applesmartbattery_draining.xml"
+    ));
 
     fn ioreg_fixture(pairs: &str) -> Vec<u8> {
         format!(
@@ -195,6 +212,40 @@ mod tests {
             "    <key>ExternalConnected</key><true/>\n    <key>IsCharging</key><true/>",
         );
         let s = parse_ioreg_plist(&xml).expect("parse");
+        assert_eq!(s.charging_state, Some(ChargingState::Charging));
+    }
+
+    #[test]
+    fn real_capture_charging_fixture() {
+        // Real values: 738 mA flowing INTO the pack at 11845 mV while
+        // charging. Our convention: negative while charging. The old
+        // /1e9 code reported this as -0.0087 W (1000x off).
+        let s = parse_ioreg_plist(FIXTURE_CHARGING.as_bytes()).expect("parse");
+        assert_eq!(s.charging_state, Some(ChargingState::Charging));
+        assert_eq!(s.voltage_mv, Some(11845.0));
+        assert_eq!(s.state_of_charge, Some(55.0));
+        assert_eq!(s.cycle_count, Some(628));
+        assert_eq!(s.design_capacity, Some(4629.0));
+        assert_eq!(s.full_charge_capacity, Some(3849.0));
+        let power = s.power_w.expect("power from real capture");
+        assert!((power - -(738.0 * 11845.0 / 1.0e6)).abs() < 1e-9);
+        assert!(power < 0.0, "charging must be negative, got {power}");
+        // The real machine had no Temperature key at all; stays None.
+        assert_eq!(s.temperature_c, None);
+    }
+
+    #[test]
+    fn real_capture_draining_fixture() {
+        // Real capture quirk: IsCharging stayed Yes while the pack lost
+        // charge (-1415 mA) under a weak 8 W adapter. The power sign must
+        // come from the Amperage data, not the IsCharging flag: positive
+        // = discharging in our convention. The old code negated based on
+        // IsCharging and would have reported -16.3 W ("charging") here.
+        let s = parse_ioreg_plist(FIXTURE_DRAINING.as_bytes()).expect("parse");
+        let power = s.power_w.expect("power from real capture");
+        assert!((power - 1415.0 * 11509.0 / 1.0e6).abs() < 1e-9);
+        assert!(power > 0.0, "discharging must be positive, got {power}");
+        // charging_state reflects the capture's own (quirky) IsCharging flag.
         assert_eq!(s.charging_state, Some(ChargingState::Charging));
     }
 }
