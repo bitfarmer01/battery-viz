@@ -8,7 +8,7 @@ optimization benchmark, rendered with egui on **wgpu** (GPU, no idle stall).
 
 ```sh
 cargo run            # run the dashboard (simulator on non macOS/Windows hosts)
-cargo test --all-targets   # 50 unit tests: parsers, model, benchmark, alerts
+cargo test --all-targets   # 51 unit tests: parsers, model, benchmark, alerts
 ```
 
 ## Alerts — battery-longevity coaching
@@ -63,7 +63,7 @@ renormalize, with the resulting coverage shown next to the score.
 ## Sources
 
 - **macOS** — `ioreg -r -n AppleSmartBattery -d 1 -a -x` (XML plist: cycle
-  count, design/full-charge capacity, temperature in tenths of °C, voltage,
+  count, design/full-charge capacity, temperature in hundredths of °C, voltage,
   charging state). No root required.
 - **Windows** — `Get-CimInstance Win32_Battery` (design/full-charge capacity,
   design voltage, charge remaining, `BatteryStatus` bits). Cycle count and
