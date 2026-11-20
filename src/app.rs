@@ -16,6 +16,13 @@ use crate::notify;
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
 
+/// M1: checkpoint the long-term store every N new minute-buckets. The old
+/// per-bucket rewrite was ~1 GB/day at full retention; 15 minutes is a 15x
+/// cut (~96 writes/day) while the worst-case crash loses 15 buckets of a
+/// 10,080-bucket retention window (~0.15%). Every checkpoint is atomic, and
+/// a graceful exit saves immediately, so a normal restart loses nothing.
+pub const SAVE_INTERVAL_MINUTES: u32 = 15;
+
 pub struct App {
     rx: Receiver<CollectorResult>,
     pub latest: Option<crate::collect::BatterySample>,
@@ -25,6 +32,11 @@ pub struct App {
     pub history_store: HistoryStore,
     /// Where the store persists; `None` when no platform data dir exists.
     history_path: Option<PathBuf>,
+    /// Sticky dashboard notice: the persisted history could not be read (it
+    /// was preserved as `history.json.corrupt`) — M2, never silent.
+    pub history_load_error: Option<String>,
+    /// New minute-buckets folded in since the last on-disk checkpoint (M1).
+    buckets_since_save: u32,
     pub last_error: Option<String>,
     /// Most recent platform-notification delivery failure (osascript /
     /// PowerShell / AUMID registration / tray build), shown in the header so
@@ -87,16 +99,29 @@ pub fn default_history_path() -> Option<PathBuf> {
 
 impl App {
     pub fn new(rx: Receiver<CollectorResult>) -> Self {
+        Self::with_history_path(rx, default_history_path())
+    }
+
+    /// Constructor with an explicit persistence path (tests inject a temp
+    /// dir; production passes [`default_history_path`]).
+    pub fn with_history_path(rx: Receiver<CollectorResult>, history_path: Option<PathBuf>) -> Self {
         // One-time platform setup: on Windows this registers the toast AUMID
         // so later toasts are not suppressed by the OS.
         notify::init();
-        // Load persisted history on startup; a missing or corrupt file starts
-        // fresh (handled inside `HistoryStore::load`).
-        let history_path = default_history_path();
-        let history_store = match &history_path {
+        // Load persisted history on startup. A missing file starts fresh; an
+        // unreadable one starts fresh too but is reported (M2) — the file was
+        // preserved as `history.json.corrupt`, never silently overwritten.
+        let load = match &history_path {
             Some(path) => HistoryStore::load(path),
-            None => HistoryStore::default(),
+            None => crate::history::LoadResult::default(),
         };
+        let history_load_error = load.load_error.map(|e| {
+            format!(
+                "prior history could not be read ({}) — starting fresh; preserved at {}",
+                e.message,
+                e.backup_path.display()
+            )
+        });
         // Menu-bar agent mode (macOS, or any host started hidden): the window
         // exists but is not shown at launch; the tray / `--hidden` toggles it.
         let start_hidden =
@@ -106,8 +131,10 @@ impl App {
             latest: None,
             benchmark: None,
             history: History::new(),
-            history_store,
+            history_store: load.store,
             history_path,
+            history_load_error,
+            buckets_since_save: 0,
             last_error: None,
             last_notify_error: None,
             frames_rendered: 0,
@@ -180,17 +207,35 @@ impl App {
         }
     }
 
-    /// Fold a sample into the long-term store; persist after each NEW bucket
-    /// (write-behind on the UI thread — the spec pins one write per bucket,
-    /// no background thread). Persistence failures surface in the header,
-    /// they never take the dashboard down.
+    /// Fold a sample into the long-term store. Checkpoints are written on a
+    /// bounded cadence (every `SAVE_INTERVAL_MINUTES` buckets, plus once on
+    /// graceful exit via the UI's `on_exit`) — the audit's per-bucket rewrite
+    /// cost ~1 GB/day at full retention. Persistence failures surface in the
+    /// header, they never take the dashboard down.
     fn record_history(&mut self, sample: &crate::collect::BatterySample) {
         let created_new_bucket = self.history_store.push(sample, crate::history::unix_now());
-        if created_new_bucket {
-            if let Some(path) = &self.history_path {
-                if let Err(e) = self.history_store.save(path) {
-                    self.last_error = Some(e);
-                }
+        self.checkpoint_history(created_new_bucket);
+    }
+
+    /// Count new buckets and checkpoint on the cadence boundary.
+    fn checkpoint_history(&mut self, created_new_bucket: bool) {
+        if !created_new_bucket {
+            return;
+        }
+        self.buckets_since_save += 1;
+        if self.buckets_since_save >= SAVE_INTERVAL_MINUTES {
+            self.save_history_now();
+        }
+    }
+
+    /// Checkpoint the store to disk immediately (cadence boundary or graceful
+    /// exit). A failed checkpoint resets the cadence so the next attempt is a
+    /// full interval away, not one bucket.
+    pub fn save_history_now(&mut self) {
+        self.buckets_since_save = 0;
+        if let Some(path) = &self.history_path {
+            if let Err(e) = self.history_store.save(path) {
+                self.last_error = Some(e);
             }
         }
     }
@@ -214,5 +259,89 @@ impl App {
         } else {
             Duration::from_secs(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tagged_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "battery-viz-app-tests-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn app_at(path: Option<PathBuf>) -> App {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        App::with_history_path(rx, path)
+    }
+
+    fn sample(soc: f64) -> crate::collect::BatterySample {
+        crate::collect::BatterySample {
+            state_of_charge: Some(soc),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn load_failure_produces_visible_notice_and_starts_fresh() {
+        let dir = tagged_dir("load-notice");
+        let path = dir.join("history.json");
+        std::fs::write(&path, "{").unwrap();
+        let app = app_at(Some(path.clone()));
+        assert!(
+            app.history_store.buckets.is_empty(),
+            "corrupt file starts fresh"
+        );
+        let notice = app
+            .history_load_error
+            .as_ref()
+            .expect("load failure surfaced as a dashboard notice");
+        assert!(notice.contains("could not be read"), "{notice}");
+        assert!(notice.contains("history.json.corrupt"), "{notice}");
+        // The unreadable file was moved aside, not left in place to be
+        // overwritten by the next checkpoint.
+        assert!(!path.exists());
+        assert!(dir.join("history.json.corrupt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkpoints_every_fifteenth_bucket_and_not_before() {
+        let dir = tagged_dir("cadence");
+        let path = dir.join("history.json");
+        let mut app = app_at(Some(path.clone()));
+        let minute0 = 1_800 * 60; // any minute-aligned unix time
+        for m in 0..(SAVE_INTERVAL_MINUTES as u64 - 1) {
+            let created = app.history_store.push(&sample(50.0), minute0 + m * 60);
+            app.checkpoint_history(created);
+            assert!(!path.exists(), "no checkpoint before the interval, m={m}");
+        }
+        let created = app
+            .history_store
+            .push(&sample(50.0), minute0 + SAVE_INTERVAL_MINUTES as u64 * 60);
+        app.checkpoint_history(created);
+        assert!(path.exists(), "checkpoint written at the interval boundary");
+        // Atomic save: the temp sibling was consumed by the rename.
+        assert!(!dir.join("history.json.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn graceful_exit_checkpoint_writes_the_store() {
+        let dir = tagged_dir("exit-save");
+        let path = dir.join("history.json");
+        let mut app = app_at(Some(path.clone()));
+        let created = app.history_store.push(&sample(50.0), 1_800 * 60);
+        app.checkpoint_history(created);
+        assert!(!path.exists(), "nothing persisted before the interval");
+        app.save_history_now();
+        assert!(path.exists(), "graceful exit persists the store");
+        assert_eq!(HistoryStore::load(&path).store, app.history_store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
