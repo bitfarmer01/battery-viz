@@ -5,6 +5,8 @@
 //!   hidden at launch, tray icon drives show/pause/quit.
 //! - Everywhere else: main window shown as before; alerts are notifications.
 
+mod advice;
+
 mod alert;
 mod app;
 mod benchmark;
@@ -14,6 +16,7 @@ mod collect;
 mod dwell;
 mod history;
 mod notify;
+mod record;
 mod ui;
 mod uninstall;
 mod warm;

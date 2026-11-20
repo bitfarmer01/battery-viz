@@ -49,6 +49,23 @@ fn clamp100(v: f64) -> f64 {
     v.clamp(0.0, 100.0)
 }
 
+/// Where the scored capacity figures come from, shown in the scorecard so
+/// the figure the app scores is never confused with the OS's own smoothed
+/// one (macOS: 85.1% raw gauge vs 90% in Settings on the reference
+/// machine). Provenance rides on the sample's source, so this stays a
+/// data-mapping — no platform-specific logic here.
+fn capacity_source_note(source: SourceKind) -> &'static str {
+    match source {
+        SourceKind::MacIoreg => {
+            "raw firmware gauge (ioreg); the macOS Settings figure can differ"
+        }
+        SourceKind::MacSystemProfiler => "firmware figures via system_profiler",
+        SourceKind::WindowsWmi => "firmware figures via WMI (Win32_Battery)",
+        SourceKind::WindowsPowerStatus => "Windows power-status figures",
+        SourceKind::Simulator => "simulated figures",
+    }
+}
+
 /// SoH: ≥90% excellent (100), linear to 0 at 50%.
 fn score_soh(s: &BatterySample) -> Option<ParameterScore> {
     let soh = state_of_health_pct(s)?;
@@ -57,7 +74,10 @@ fn score_soh(s: &BatterySample) -> Option<ParameterScore> {
         name: "State of health",
         score,
         weight: weights::SOH,
-        detail: format!("Full-charge capacity is {soh:.1}% of design"),
+        detail: format!(
+            "Full-charge capacity is {soh:.1}% of design — {}",
+            capacity_source_note(s.source)
+        ),
     })
 }
 
@@ -346,5 +366,20 @@ mod tests {
             .unwrap();
         assert!(factor30.score < factor.score, "dwell must cost points");
         assert!((factor30.score - 92.0).abs() < 1e-9, "{}", factor30.score);
+    }
+
+    #[test]
+    fn soh_detail_names_the_capacity_source() {
+        let mut s = full_sample();
+        s.source = SourceKind::MacIoreg;
+        let detail = score_soh(&s).unwrap().detail;
+        assert!(
+            detail.contains("raw firmware gauge (ioreg)") && detail.contains("Settings"),
+            "macOS label distinguishes the raw gauge from the Settings figure: {detail}"
+        );
+        s.source = SourceKind::WindowsWmi;
+        assert!(score_soh(&s).unwrap().detail.contains("WMI"));
+        s.source = SourceKind::Simulator;
+        assert!(score_soh(&s).unwrap().detail.contains("simulated"));
     }
 }

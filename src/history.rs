@@ -386,8 +386,9 @@ impl HistoryStore {
 }
 
 /// Sibling temp path for an atomic write: same directory as `path` so the
-/// final rename never crosses a filesystem boundary.
-fn temp_sibling(path: &Path) -> PathBuf {
+/// final rename never crosses a filesystem boundary. Shared with the daily
+/// record (FR-7).
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -423,8 +424,9 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
 /// Move an unreadable history file aside to `<name>.corrupt`, preserving its
 /// bytes. An earlier backup is never overwritten in place — the first
 /// collision takes `<name>.corrupt.1`, then `.2`, … — so a run of bad
-/// checkpoints keeps every one of them.
-fn quarantine(path: &Path, message: String) -> LoadError {
+/// checkpoints keeps every one of them. Shared with the daily record
+/// (FR-7), which keeps the same discipline.
+pub(crate) fn quarantine(path: &Path, message: String) -> LoadError {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -458,31 +460,32 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Minimal tokenizer for the fixed schema above — not a general JSON parser.
-struct Parser<'a> {
+/// Minimal tokenizer for the fixed store schemas — not a general JSON
+/// parser. Shared by the history and daily-record (FR-7) parsers.
+pub(crate) struct Parser<'a> {
     b: &'a [u8],
     i: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn new(text: &'a str) -> Self {
+    pub(crate) fn new(text: &'a str) -> Self {
         Parser {
             b: text.as_bytes(),
             i: 0,
         }
     }
 
-    fn skip_ws(&mut self) {
+    pub(crate) fn skip_ws(&mut self) {
         while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
             self.i += 1;
         }
     }
 
-    fn peek(&self) -> Option<u8> {
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
 
-    fn eat(&mut self, c: u8) -> bool {
+    pub(crate) fn eat(&mut self, c: u8) -> bool {
         self.skip_ws();
         if self.peek() == Some(c) {
             self.i += 1;
@@ -492,7 +495,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, c: u8) -> Result<(), String> {
+    pub(crate) fn expect(&mut self, c: u8) -> Result<(), String> {
         if self.eat(c) {
             Ok(())
         } else {
@@ -500,8 +503,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `"<key>":` with exactly the keys this schema uses.
-    fn expect_key(&mut self, key: &str) -> Result<(), String> {
+    /// `"<key>":` with exactly the keys these schemas use.
+    pub(crate) fn expect_key(&mut self, key: &str) -> Result<(), String> {
         self.skip_ws();
         self.expect(b'"')?;
         for expected in key.bytes() {
@@ -516,7 +519,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn number(&mut self) -> Result<f64, String> {
+    pub(crate) fn number(&mut self) -> Result<f64, String> {
         self.skip_ws();
         let start = self.i;
         while self
@@ -532,7 +535,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Comma-separated numbers up to the closing `]` (consumed).
-    fn number_list(&mut self) -> Result<Vec<f64>, String> {
+    pub(crate) fn number_list(&mut self) -> Result<Vec<f64>, String> {
         let mut out = Vec::new();
         loop {
             out.push(self.number()?);

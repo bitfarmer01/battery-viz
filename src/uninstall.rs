@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 /// Every artifact this installation creates: the `battery-viz` data
-/// directory (`history.json` lives inside) and the CSV export file next to
+/// directory (the 1-minute `history.json` and the FR-7 daily record
+/// `daily-record.json` both live inside it) and the CSV export file next to
 /// it. Paths are returned whether or not they exist; the UI lists only the
 /// ones that do.
 pub fn paths() -> Vec<PathBuf> {
@@ -18,7 +19,8 @@ pub fn paths() -> Vec<PathBuf> {
 
 /// The two artifacts for an installation, derived from the history path the
 /// app persists to (`<data dir>/battery-viz/history.json`): its containing
-/// `battery-viz` directory and the sibling CSV export. Deriving from the
+/// `battery-viz` directory — which covers every store inside it, including
+/// the FR-7 daily record — and the sibling CSV export. Deriving from the
 /// history path keeps the app's own confirm flow pointed at the same data
 /// dir it was booted with (the seam tests use).
 pub fn artifacts_for(history_path: &Path) -> Vec<PathBuf> {
@@ -121,6 +123,27 @@ mod tests {
             return; // no platform data dir — nothing to enumerate
         }
         assert_eq!(paths().len(), 2);
+    }
+
+    #[test]
+    fn deletion_covers_the_fr7_daily_record_store() {
+        // The FR-7 record (`daily-record.json`) is a sibling of
+        // `history.json` inside the app dir, so the directory entry in the
+        // deletion list removes it — no separate listing, no double delete.
+        let base = temp_data_dir("fr7-record");
+        let record = base.join("battery-viz").join("daily-record.json");
+        let artifacts = artifacts_for(&base.join("battery-viz").join("history.json"));
+        assert!(
+            artifacts.iter().any(|p| record.starts_with(p)),
+            "daily record {record:?} must fall inside a listed deletion target: {artifacts:?}"
+        );
+        // And end to end: deleting the listed artifacts removes the record.
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "{}").unwrap();
+        let results = remove_paths(artifacts);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(!record.exists(), "daily record deleted with the app dir");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

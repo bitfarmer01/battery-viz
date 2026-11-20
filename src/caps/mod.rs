@@ -164,6 +164,19 @@ pub struct SettingGuidance {
     pub url: Option<&'static str>,
 }
 
+/// One day of capacity history a machine already holds, offered by an
+/// adapter to seed FR-7's daily record on first run (Windows: the daily
+/// rows of `powercfg /batteryreport`). An empty list means "nothing to
+/// seed from" — the record simply starts empty, never a guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeedCapacity {
+    /// Day the reading is from, days since the local Unix epoch (the same
+    /// counter as `clock::LocalNow.day`).
+    pub day: u32,
+    /// Full-charge over design capacity, percent.
+    pub soh_pct: f64,
+}
+
 /// One platform adapter: readable metrics, detectable settings, guidance.
 pub trait Capabilities: Send {
     fn platform(&self) -> Platform;
@@ -177,6 +190,12 @@ pub trait Capabilities: Send {
     /// Where the user changes this setting. `None` when there is nothing
     /// meaningful to point at.
     fn guidance(&self, kind: SettingKind) -> Option<SettingGuidance>;
+    /// Capacity history this machine already holds, to seed the FR-7 daily
+    /// record on first run. Default: unavailable — an adapter with no
+    /// source of prior history offers none, and nothing is invented.
+    fn capacity_seed(&self) -> Vec<SeedCapacity> {
+        Vec::new()
+    }
 }
 
 /// Best adapter for this platform, for feature code (FR-1+).

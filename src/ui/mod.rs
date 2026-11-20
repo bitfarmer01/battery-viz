@@ -184,6 +184,10 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
+            if let Some(err) = &app.record_load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
+            }
             ui.separator();
             let pause_label = if app.alerts_paused {
                 "▶ Resume alerts"
