@@ -2,7 +2,7 @@
 //!
 //! `ioreg -r -n AppleSmartBattery -d 1 -a -x` emits an XML property list with
 //! CycleCount, DesignCapacity, FullChargeCapacity/NominalChargeCapacity,
-//! Temperature (tenths of °C), Voltage (mV) and ExternalConnected. No root
+//! Temperature (hundredths of °C), Voltage (mV) and ExternalConnected. No root
 //! required on stock macOS.
 
 use std::io::Cursor;
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn temperature_uses_tenths_of_degree() {
+    fn temperature_uses_hundredths_of_degree() {
         let xml = ioreg_fixture("    <key>Temperature</key><integer>3100</integer>");
         let s = parse_ioreg_plist(&xml).expect("parse");
         assert!((s.temperature_c.unwrap() - 31.0).abs() < 1e-9);
