@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 
+use crate::advice::{self, SettingAdvice};
 use crate::alert::{Alert, AlertEngine, ClockInput};
 use crate::benchmark::{self, BenchmarkResult};
 use crate::clock;
@@ -35,6 +36,18 @@ pub struct App {
     /// Sticky dashboard notice: the persisted history could not be read (it
     /// was preserved as `history.json.corrupt`) — M2, never silent.
     pub history_load_error: Option<String>,
+    /// FR-5 one-time advice card, or `None` when the machine has no
+    /// adaptive-charging equivalent to point at, the stored history does not
+    /// show the deep-discharge pattern, or the advice was already said.
+    pub full_charge_advice: Option<SettingAdvice>,
+    /// The adapter's answer for adaptive charging, resolved once at startup
+    /// (it is static per machine): `None` hides the feature entirely.
+    adaptive_advice: Option<SettingAdvice>,
+    /// The FR-5 advice has been said; persisted so it is never said again.
+    advice_shown: bool,
+    /// Where the one-shot advice flag persists; `None` when no platform
+    /// data dir exists (the card never shows).
+    advice_state_path: Option<PathBuf>,
     /// New minute-buckets folded in since the last on-disk checkpoint (M1).
     buckets_since_save: u32,
     /// Monotonic time of the last dwell-accumulated sample (audit H4);
@@ -115,6 +128,10 @@ pub fn default_history_path() -> Option<PathBuf> {
     dirs::data_dir().map(|d| d.join("battery-viz").join("history.json"))
 }
 
+/// On-disk marker for FR-5's one-shot flag (sibling of the history file).
+const ADVICE_STATE_FILE: &str = "advice-state.json";
+const ADVICE_SHOWN_MARKER: &str = "{\"adaptive_charging_advice_shown\":true}";
+
 impl App {
     pub fn new(rx: Receiver<CollectorResult>) -> Self {
         Self::with_history_path(rx, default_history_path())
@@ -144,7 +161,23 @@ impl App {
         // exists but is not shown at launch; the tray / `--hidden` toggles it.
         let start_hidden =
             cfg!(target_os = "macos") || std::env::var("BATTERY_VIZ_START_HIDDEN").is_ok();
-        App {
+        // FR-5 one-shot flag: a marker file beside the history store. Its
+        // absence (fresh start, no data dir) simply means the advice has
+        // not been said yet.
+        let advice_state_path = history_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join(ADVICE_STATE_FILE));
+        let advice_shown = advice_state_path.as_deref().is_some_and(|path| {
+            match std::fs::read_to_string(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Ok(text) if text.contains("adaptive_charging_advice_shown\":true") => true,
+                // Existing but unreadable or corrupt: assume said. The
+                // once-ever guarantee must not silently reset on a crash.
+                _ => true,
+            }
+        });
+        let mut app = App {
             rx,
             latest: None,
             benchmark: None,
@@ -152,6 +185,14 @@ impl App {
             history_store: load.store,
             history_path,
             history_load_error,
+            full_charge_advice: None,
+            // Static per machine: resolve the adapter once, not per recompute
+            // (on Windows a fresh adapter means a fresh PowerShell query).
+            adaptive_advice: advice::adaptive_charging_advice(
+                crate::caps::platform_capabilities().as_ref(),
+            ),
+            advice_shown,
+            advice_state_path,
             buckets_since_save: 0,
             dwell_prev_s: None,
             last_error: None,
@@ -167,7 +208,9 @@ impl App {
             quit_requested: false,
             sampler_stopped: false,
             start: std::time::Instant::now(),
-        }
+        };
+        app.recompute_full_charge_advice();
+        app
     }
 
     /// Drain pending samples (non-blocking) and refresh derived state.
@@ -283,6 +326,44 @@ impl App {
     fn record_history(&mut self, sample: &crate::collect::BatterySample) {
         let created_new_bucket = self.history_store.push(sample, crate::history::unix_now());
         self.checkpoint_history(created_new_bucket);
+        // A new bucket can change the multi-day pattern FR-5 keys on; the
+        // recompute is a cheap scan of the retained window, once a minute.
+        if created_new_bucket {
+            self.recompute_full_charge_advice();
+        }
+    }
+
+    /// FR-5: rebuild the one-time advice card from the current pattern and
+    /// adapter answers. A no-op once the advice has been said, while a card
+    /// is already up, or when there is nothing new to say — the card never
+    /// downgrades itself out of view mid-session, and never shows twice.
+    fn recompute_full_charge_advice(&mut self) {
+        if self.advice_shown || self.full_charge_advice.is_some() {
+            return;
+        }
+        // One clock read for both the local slice and the unix instant: two
+        // reads can straddle an hour tick and shift the daytime window by an
+        // hour on the very evaluation that persists the once-ever flag.
+        let local = clock::local_now();
+        if !advice::regular_deep_daytime_discharge(&self.history_store.buckets, local) {
+            return;
+        }
+        self.full_charge_advice = self.adaptive_advice.clone();
+    }
+
+    /// Record that the FR-5 advice has been said: persist the flag so it is
+    /// never said again (even across restarts) and stop recomputing. The
+    /// card itself stays up for the session until dismissed.
+    pub fn mark_full_charge_advice_shown(&mut self) {
+        if self.advice_shown {
+            return;
+        }
+        self.advice_shown = true;
+        if let Some(path) = &self.advice_state_path {
+            if let Err(e) = crate::history::atomic_write(path, ADVICE_SHOWN_MARKER.as_bytes()) {
+                self.last_error = Some(format!("persist advice state: {e}"));
+            }
+        }
     }
 
     /// Count new buckets and checkpoint on the cadence boundary.

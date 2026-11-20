@@ -13,6 +13,12 @@ pub struct LocalNow {
     pub hour: u8,
     /// Days since the Unix epoch.
     pub day: u32,
+    /// Unix seconds of the exact instant this slice was read from. Consumers
+    /// that also need "now" in unix time MUST take it from here, not from a
+    /// second clock read: two reads can straddle an hour tick and disagree by
+    /// a full hour (this once shifted the FR-5 daytime window on the very
+    /// evaluation that persists its once-ever flag).
+    pub unix_secs: i64,
 }
 
 /// Read the OS local time.
@@ -24,8 +30,12 @@ pub fn local_now() -> LocalNow {
 
     #[cfg(windows)]
     {
-        let (hour, day) = windows_local_now();
-        LocalNow { hour, day }
+        let (hour, day, unix_secs) = windows_local_now();
+        LocalNow {
+            hour,
+            day,
+            unix_secs,
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -83,15 +93,23 @@ fn unix_local_now() -> Option<LocalNow> {
         let hour = tm.tm_hour.clamp(0, 23) as u8;
         let local_secs = now + tm.tm_gmtoff;
         let day = local_secs.div_euclid(86_400) as u32;
-        Some(LocalNow { hour, day })
+        // `now` is the single time(2) read; both the local slice and the unix
+        // instant come from it.
+        Some(LocalNow {
+            hour,
+            day,
+            unix_secs: now,
+        })
     } else {
         None
     }
 }
 
-/// Local hour and day index (days since local epoch) from WinAPI.
+/// Local hour, day index (days since local epoch), and unix instant from
+/// WinAPI. One clock read: the unix instant is derived from the same
+/// GetLocalTime civil time via the zone bias, not from a second clock read.
 #[cfg(windows)]
-fn windows_local_now() -> (u8, u32) {
+fn windows_local_now() -> (u8, u32, i64) {
     #[repr(C)]
     struct SystemTime {
         w_year: u16,
@@ -104,10 +122,32 @@ fn windows_local_now() -> (u8, u32) {
         w_milliseconds: u16,
     }
 
-    extern "system" {
-        fn GetLocalTime(lp_system_time: *mut SystemTime);
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
     }
 
+    extern "system" {
+        fn GetLocalTime(lp_system_time: *mut SystemTime);
+        fn GetTimeZoneInformation(lptimezoneinformation: *mut TimeZoneInformation) -> u32;
+    }
+
+    let zeroed = SystemTime {
+        w_year: 0,
+        w_month: 0,
+        w_day_of_week: 0,
+        w_day: 0,
+        w_hour: 0,
+        w_minute: 0,
+        w_second: 0,
+        w_milliseconds: 0,
+    };
     let mut st = SystemTime {
         w_year: 0,
         w_month: 0,
@@ -121,7 +161,33 @@ fn windows_local_now() -> (u8, u32) {
     unsafe { GetLocalTime(&mut st) };
     let hour = st.w_hour.clamp(0, 23) as u8;
     let day = days_from_civil(st.w_year as i64, st.w_month as i64, st.w_day as i64) as u32;
-    (hour, day)
+
+    // UTC = local + bias minutes (daylight bias applies when the zone reports
+    // TIME_ZONE_ID_DAYLIGHT == 2). A zone read is not a clock read, so this
+    // keeps the local slice and the unix instant on the same instant.
+    let mut tzi = TimeZoneInformation {
+        bias: 0,
+        standard_name: [0; 32],
+        standard_date: zeroed,
+        standard_bias: 0,
+        daylight_name: [0; 32],
+        daylight_date: zeroed,
+        daylight_bias: 0,
+    };
+    let zone_id = unsafe { GetTimeZoneInformation(&mut tzi) };
+    let in_daylight = zone_id == 2;
+    let bias_min = tzi.bias
+        + if in_daylight {
+            tzi.daylight_bias
+        } else {
+            tzi.standard_bias
+        };
+    let local_as_utc = days_from_civil(st.w_year as i64, st.w_month as i64, st.w_day as i64)
+        * 86_400
+        + st.w_hour as i64 * 3_600
+        + st.w_minute as i64 * 60
+        + st.w_second as i64;
+    (hour, day, local_as_utc - bias_min as i64 * 60)
 }
 
 /// Days since 1970-01-01 from a civil date (Hinnant's days_from_civil).
@@ -144,7 +210,11 @@ fn utc_fallback_now() -> LocalNow {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as i64;
-    LocalNow { hour: ((secs / 3_600) % 24) as u8, day: (secs / 86_400).max(0) as u32 }
+    LocalNow {
+        hour: ((secs / 3_600) % 24) as u8,
+        day: (secs / 86_400).max(0) as u32,
+        unix_secs: secs,
+    }
 }
 
 #[cfg(test)]
