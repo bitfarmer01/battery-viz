@@ -9,10 +9,12 @@ use crossbeam_channel::Receiver;
 use crate::advice::{self, SettingAdvice};
 use crate::alert::{Alert, AlertEngine, ClockInput};
 use crate::benchmark::{self, BenchmarkResult};
+use crate::caps::MetricId;
 use crate::clock;
 use crate::collect::CollectorResult;
 use crate::history::HistoryStore;
 use crate::notify;
+use crate::warm::{self, WarmHoursReport};
 
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
@@ -83,6 +85,10 @@ pub struct App {
     /// drained, but nothing is recorded or alerted — a live sampler must
     /// never re-write history mid-delete.
     sampler_stopped: bool,
+    /// FR-4 gate, read once from the FR-0 adapter: does this machine expose
+    /// a temperature reading at all? False — as on many Windows machines —
+    /// the whole heat digest hides itself; no heat UI is ever rendered.
+    temperature_available: bool,
     /// Monotonic origin for the engine's injected clock.
     start: std::time::Instant,
 }
@@ -207,6 +213,10 @@ impl App {
             uninstall_command_copied: false,
             quit_requested: false,
             sampler_stopped: false,
+            // Features never sniff the platform; they ask the FR-0 adapter.
+            temperature_available: crate::caps::platform_capabilities()
+                .readable_metrics()
+                .contains(&MetricId::Temperature),
             start: std::time::Instant::now(),
         };
         app.recompute_full_charge_advice();
@@ -258,6 +268,19 @@ impl App {
             self.benchmark = Some(benchmark::evaluate(&sample));
             self.latest = Some(sample);
         }
+    }
+
+    /// FR-4: the week's warm-hour digest, or `None` when the feature hides
+    /// itself — the adapter reports temperature Unavailable, or the stored
+    /// history holds no temperature readings in the window. Digest-channel
+    /// data: never delivered as a real-time alert (the sustained ≥45 °C
+    /// HighTemp alert in `alert` remains the only real-time heat channel).
+    pub fn weekly_heat_digest(&self) -> Option<WarmHoursReport> {
+        if !self.temperature_available {
+            return None;
+        }
+        let now = crate::history::unix_now();
+        warm::weekly_report(&self.history_store, now / 60, clock::utc_offset_hours(now))
     }
 
     /// Advance the alert engine by one sample and deliver a nudge when it
@@ -432,6 +455,14 @@ mod tests {
     fn app_at(path: Option<PathBuf>) -> App {
         let (_tx, rx) = crossbeam_channel::unbounded();
         App::with_history_path(rx, path)
+    }
+
+    /// Simulate a machine whose adapter reports temperature Unavailable
+    /// (many Windows WMI setups): the FR-4 gate must hide the digest.
+    fn heat_hidden_app(path: Option<PathBuf>) -> App {
+        let mut app = app_at(path);
+        app.temperature_available = false;
+        app
     }
 
     fn sample(soc: f64) -> crate::collect::BatterySample {
@@ -634,5 +665,58 @@ mod tests {
         assert!(!app.uninstall_requested);
         assert!(app.uninstall_results.is_none());
         assert!(!path.exists(), "cancel never deletes");
+    }
+
+    #[test]
+    fn heat_digest_hides_when_adapter_reports_temperature_unavailable() {
+        // Even with warm history in the store, an adapter without a
+        // temperature reading means no heat UI — FR-4 acceptance.
+        let mut app = heat_hidden_app(None);
+        app.history_store.push(
+            &crate::collect::BatterySample {
+                temperature_c: Some(40.0),
+                ..Default::default()
+            },
+            crate::history::unix_now(),
+        );
+        assert!(app.weekly_heat_digest().is_none());
+    }
+
+    #[test]
+    fn heat_digest_hidden_with_no_temperature_history_even_when_supported() {
+        // Supported adapter but a fresh install (empty store): nothing to
+        // reconcile with, so no digest either — never a zero presented as
+        // data.
+        let app = app_at(None);
+        assert!(app.weekly_heat_digest().is_none());
+    }
+
+    #[test]
+    fn heat_digest_counts_from_the_stored_history() {
+        // One warm minute and one cool minute in the store: the digest must
+        // match the history exactly (0.5 h covered, 1 warm minute → the UI
+        // shows the same number the CSV export would produce).
+        let mut app = app_at(None);
+        let now = crate::history::unix_now();
+        app.history_store.push(
+            &crate::collect::BatterySample {
+                temperature_c: Some(31.0),
+                ..Default::default()
+            },
+            now - 120,
+        );
+        app.history_store.push(
+            &crate::collect::BatterySample {
+                temperature_c: Some(25.0),
+                ..Default::default()
+            },
+            now - 60,
+        );
+        let digest = app
+            .weekly_heat_digest()
+            .expect("digest when temperature is readable");
+        assert_eq!(digest.warm_minutes, 1);
+        assert_eq!(digest.covered_minutes, 2);
+        assert_eq!(digest.warm_hours(), 1.0 / 60.0);
     }
 }

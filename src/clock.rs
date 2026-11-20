@@ -202,6 +202,17 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Local − UTC offset in whole hours, derived from the current local and
+/// UTC clocks. Used to place historical UTC minutes into local hour-of-day
+/// bins (FR-4 attribution). Truncated toward zero at half-hour time zones
+/// and ±1 h off across a DST switch inside a 7-day window — hour-of-day
+/// attribution is a likelihood, not a clock.
+pub fn utc_offset_hours(unix_secs: u64) -> i64 {
+    let local = local_now();
+    let local_hours = local.day as i64 * 24 + local.hour as i64;
+    local_hours - (unix_secs / 3_600) as i64
+}
+
 /// No libc/WinAPI available (non-unix, non-Windows builds): fall back to UTC.
 /// Quiet hours then follow UTC; acceptable for a host that has neither of
 /// the two supported platform APIs.
@@ -231,5 +242,21 @@ mod tests {
     fn day_is_plausibly_recent() {
         // 2026-01-01 is day ~20454 since the epoch.
         assert!(local_now().day > 20_000);
+    }
+
+    #[test]
+    fn utc_offset_is_within_plausible_zones() {
+        let offset = utc_offset_hours(unix_now_secs());
+        assert!(
+            (-14..=12).contains(&offset),
+            "offset {offset} h outside real zones"
+        );
+    }
+
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 }

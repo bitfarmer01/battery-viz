@@ -241,6 +241,7 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 draw_live_gauges(ui, app);
                 draw_plots(ui, app);
                 draw_trends(ui, app, export_status);
+                draw_weekly_digest(ui, app);
             });
         });
 
@@ -533,6 +534,26 @@ fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>)
             ui.weak(egui::RichText::new(status.as_str()).small());
         }
     });
+}
+
+/// FR-4 weekly digest — heat. Drawn only when the app has a report: the
+/// FR-0 adapter reports temperature Unavailable or the stored history has
+/// no temperature readings, this renders nothing at all — no heading, no
+/// placeholder. Digest channel, never a notification: real-time heat
+/// coaching stays with the sustained ≥45 °C alert.
+fn draw_weekly_digest(ui: &mut egui::Ui, app: &App) {
+    let Some(report) = app.weekly_heat_digest() else {
+        return;
+    };
+    ui.add_space(8.0);
+    ui.heading("Weekly digest — heat");
+    ui.add_space(2.0);
+    ui.label(report.digest_line());
+    ui.weak(egui::RichText::new(format!(
+        "Counted from {:.1} h of 1-minute history at ≥ {:.0} °C. Slow problem, so it is only reported here — the sustained 45 °C alert still fires in real time.",
+        report.covered_hours(),
+        crate::warm::WARM_THRESHOLD_C
+    )).small());
 }
 
 /// Modal confirm: what gets deleted (only paths that exist), what does not,
