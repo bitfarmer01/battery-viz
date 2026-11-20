@@ -49,23 +49,9 @@ pub fn spawn_collector(mut collector: Box<dyn Collector>) -> Receiver<CollectorR
     rx
 }
 
-/// Pick the best collector for this platform at runtime.
-pub fn platform_default() -> Box<dyn Collector> {
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(macos::MacCollector::new())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Box::new(windows::WindowsCollector::new())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        // Dev platforms: deterministic simulator so the UI is testable anywhere.
-        Box::new(sim::SimCollector::new())
-    }
-}
-
+// Platform selection now lives in `crate::caps` (FR-0): `caps::platform_collector()`
+// returns the adapter for this platform, and the adapters delegate to the
+// collectors below.
 #[cfg(test)]
 mod tests {
     use super::*;
