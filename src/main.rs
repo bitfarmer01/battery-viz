@@ -14,6 +14,7 @@ mod collect;
 mod history;
 mod notify;
 mod ui;
+mod uninstall;
 
 use eframe::egui::ViewportBuilder;
 
@@ -28,8 +29,11 @@ fn main() -> eframe::Result<()> {
     // Hidden agent mode never renders, so it boots with a minimal surface;
     // showing the dashboard from the tray restores the full size. This keeps
     // the swapchain and framebuffer allocations tiny while hidden.
-    let (width, height, min) =
-        if start_hidden { (320.0, 200.0, [320.0, 200.0]) } else { (1280.0, 800.0, [900.0, 600.0]) };
+    let (width, height, min) = if start_hidden {
+        (320.0, 200.0, [320.0, 200.0])
+    } else {
+        (1280.0, 800.0, [900.0, 600.0])
+    };
     let viewport = ViewportBuilder::default()
         .with_inner_size([width, height])
         .with_min_inner_size(min)
@@ -57,8 +61,7 @@ fn main() -> eframe::Result<()> {
         "Battery Viz — battery optimization visualizer",
         native_options,
         Box::new(move |_cc| {
-            Ok(Box::new(ui::Dashboard::new(app::App::new(rx)))
-                as Box<dyn eframe::App>)
+            Ok(Box::new(ui::Dashboard::new(app::App::new(rx))) as Box<dyn eframe::App>)
         }),
     )
 }
