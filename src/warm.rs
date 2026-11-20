@@ -36,8 +36,11 @@ const PEAK_CAUSE_SHARE: f64 = 0.4;
 /// What most likely made the pack warm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarmCause {
-    /// Most warm minutes happened while the pack was charging.
-    ChargingUnderLoad,
+    /// Most warm minutes happened while the pack was charging. The stored
+    /// history records charge state only — load is not measured — so the
+    /// label is "charging while warm", read as the spec's "charging under
+    /// load" conservatively.
+    ChargingWhileWarm,
     /// Warm minutes cluster in a few local hours — ambient heat, sun load,
     /// a hot room.
     TimeOfDay,
@@ -74,13 +77,17 @@ impl WarmHoursReport {
     }
 
     /// The likely cause. Meaningful only when `warm_minutes > 0`; an empty
-    /// week has no cause to attribute.
+    /// or hand-built zero report has no cause to attribute and reads Mixed
+    /// rather than dividing by zero.
     pub fn cause(&self) -> WarmCause {
         let warm = self.warm_minutes as f64;
+        if self.warm_minutes == 0 {
+            return WarmCause::Mixed;
+        }
         let charging_share = self.charging_warm_minutes as f64 / warm;
         let peak_share = self.peak_hour_warm_minutes as f64 / warm;
         if charging_share >= CHARGING_CAUSE_SHARE {
-            WarmCause::ChargingUnderLoad
+            WarmCause::ChargingWhileWarm
         } else if peak_share >= PEAK_CAUSE_SHARE {
             WarmCause::TimeOfDay
         } else {
@@ -99,14 +106,14 @@ impl WarmHoursReport {
         }
         let hours = format_hours(self.warm_hours());
         match self.cause() {
-            WarmCause::ChargingUnderLoad => format!(
+            WarmCause::ChargingWhileWarm => format!(
                 "{hours} above {:.0} °C this week, mostly while charging — charge on a hard surface out of the sun, and unplug once full.",
                 WARM_THRESHOLD_C
             ),
             WarmCause::TimeOfDay => {
                 let hour = self.peak_hour.unwrap_or(0);
                 format!(
-                    "{hours} above {:.0} °C this week, clustering around {}:00–{}:00 local — likely ambient heat; keep the machine shaded and vented then.",
+                    "{hours} above {:.0} °C this week, clustering around approximately {}:00–{}:00 local — likely ambient heat; keep the machine shaded and vented then.",
                     WARM_THRESHOLD_C,
                     hour,
                     (hour + 2) % 24
@@ -308,14 +315,30 @@ mod tests {
     }
 
     #[test]
+    fn hand_built_zero_report_cause_is_mixed_not_nan() {
+        // Fields are public, so a hand-built all-zero report is possible;
+        // cause() must not divide by zero or read a NaN comparison as a
+        // cause it did not measure.
+        let report = WarmHoursReport {
+            warm_minutes: 0,
+            charging_warm_minutes: 0,
+            peak_hour: None,
+            peak_hour_warm_minutes: 0,
+            covered_minutes: 0,
+        };
+        assert_eq!(report.cause(), WarmCause::Mixed);
+    }
+
+    #[test]
     fn mostly_charging_warm_buckets_attribute_to_charging() {
-        // 3 warm minutes, all while charging → ChargingUnderLoad.
+        // 3 warm minutes, all while charging → ChargingWhileWarm (charge
+        // state only; load is not measured, so the label claims no more).
         let temps = [Some(33.0), Some(34.0), Some(35.0), Some(25.0)];
         let charging = [true, true, true, false];
         let s = store(&temps, &charging, MIN0);
         let report = weekly_report(&s, MIN0 + 3, OFFSET).unwrap();
         assert_eq!(report.charging_warm_minutes, 3);
-        assert_eq!(report.cause(), WarmCause::ChargingUnderLoad);
+        assert_eq!(report.cause(), WarmCause::ChargingWhileWarm);
         let line = report.digest_line();
         assert!(line.contains("mostly while charging"), "{line}");
     }
