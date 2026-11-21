@@ -1040,11 +1040,21 @@ mod tests {
             app.cap_assessment(),
             crate::caplevel::CapAssessment::NeedHistory { days: 0 }
         );
-        // Seven normal days dipping to 62%: the adapter's lowest covering
-        // level (sim/macOS grid 80–100 step 5 → 80) is recommended.
+        // Seven normal days draining unplugged 80 → 60: usage 20 + 20
+        // reserve = 40 → the adapter's lowest covering level (sim/macOS
+        // grid 80–100 step 5 → 80) is recommended.
         for day in 0..7u32 {
-            let mut s = sample(62.0);
-            app.daily_record.fold(&s, day);
+            let mut s = crate::collect::BatterySample {
+                state_of_charge: Some(80.0),
+                charging_state: Some(crate::collect::types::ChargingState::Discharging),
+                ..Default::default()
+            };
+            for i in 0..crate::caplevel::MIN_DAY_SAMPLES {
+                s.state_of_charge =
+                    Some(80.0 - 20.0 * i as f64 / (crate::caplevel::MIN_DAY_SAMPLES - 1) as f64);
+                app.daily_record.fold(&s, day);
+            }
+            s.charging_state = None;
             s.state_of_charge = Some(100.0);
             for _ in 0..crate::caplevel::MIN_DAY_SAMPLES {
                 app.daily_record.fold(&s, day);
@@ -1054,7 +1064,7 @@ mod tests {
             app.cap_assessment(),
             crate::caplevel::CapAssessment::Recommend(crate::caplevel::CapRecommendation {
                 level_pct: 80,
-                lowest_pct: 62.0,
+                usage_pct: 20.0,
                 days: 7
             })
         );

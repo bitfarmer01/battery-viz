@@ -91,7 +91,7 @@ pub struct WeeklyDigest {
     /// First and last mean state-of-health readings of the window, when
     /// the record holds two or more. Measured deltas, never extrapolated.
     pub soh: Option<(f64, f64)>,
-    /// Hours at or above the high-charge band in the window. `None` when
+    /// Hours above the high-charge threshold in the window. `None` when
     /// the adapter reports state of charge Unavailable.
     pub high_charge_hours: Option<f64>,
     /// The FR-4 warm report for the same window, already gated on the
@@ -154,8 +154,14 @@ impl WeeklyDigest {
         };
 
         // High-charge time: every sample in the row carried a state of
-        // charge (the row counts only ≥80% samples), so the sum is real
-        // whenever the adapter reads state of charge at all.
+        // charge (the row counts only samples meaningfully above the
+        // high-charge threshold — re-audit N3: a machine correctly holding
+        // AT its 80% cap accrues none), so the sum is real whenever the
+        // adapter reads state of charge at all. Legacy-era rows (written
+        // before the N3 threshold change) had their high-charge stock
+        // retired at load — review LOW 1 — so the sum never describes
+        // old-threshold hours under the new threshold's wording; the
+        // first post-upgrade week can only under-report, never mislabel.
         let high_charge_hours = if input.soc_available {
             Some(window.iter().map(|r| r.high_hours()).sum())
         } else {
@@ -221,8 +227,9 @@ impl WeeklyDigest {
         let mut lines = Vec::new();
         if let Some(h) = self.high_charge_hours {
             lines.push(format!(
-                "{} at ≥ 80% charge — the biggest single ager.",
-                crate::warm::format_hours(h)
+                "{} above {:.0}% charge — the biggest single ager.",
+                crate::warm::format_hours(h),
+                crate::dwell::dwell_threshold()
             ));
         }
         if let Some(w) = &self.warm {
@@ -259,7 +266,11 @@ impl WeeklyDigest {
     pub fn notification_body(&self) -> String {
         let mut summary = Vec::new();
         if let Some(h) = self.high_charge_hours {
-            summary.push(format!("{} above 80% charge", crate::warm::format_hours(h)));
+            summary.push(format!(
+                "{} above {:.0}% charge",
+                crate::warm::format_hours(h),
+                crate::dwell::dwell_threshold()
+            ));
         }
         if let Some(w) = &self.warm {
             if w.warm_minutes > 0 {
@@ -497,6 +508,10 @@ mod tests {
             warm_n: 0,
             soc_n: 0,
             soc_min: None,
+            disch_n: 0,
+            disch_min: None,
+            disch_max: None,
+            disch_tracked: true,
         }
     }
 

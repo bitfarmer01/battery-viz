@@ -1,19 +1,41 @@
-//! High-charge dwell accumulation (audit H4).
+//! High-charge dwell accumulation (audit H4; re-audit N3).
 //!
 //! The benchmark's high-charge-dwell factor needs the time the pack spends
-//! parked at or above [`DWELL_SOC_PCT`] while plugged in — a quantity no
+//! meaningfully above [`DWELL_SOC_PCT`] while plugged in — a quantity no
 //! collector reports. The app layer derives it from the incoming sample
 //! stream here: each sample credits the elapsed time since the previous one
 //! when the pack qualifies, and the running total is persisted by the history
 //! store so it survives restarts.
+//!
+//! "Meaningfully above" is the band top plus a small hysteresis margin
+//! ([`dwell_threshold`]): a machine correctly holding exactly AT its 80%
+//! charge cap accrues nothing — dwell is excess above the cap behaviour,
+//! not the hold itself — while a machine parked at 100% on AC still credits
+//! every second, as before.
 //!
 //! Time injection mirrors the alert engine's clock seam: callers pass a
 //! monotonic `now_s`, keeping the math pure and deterministic to test.
 
 use crate::collect::types::{BatterySample, ChargingState};
 
-/// Dwell counts at or above this state of charge, percent.
+/// Dwell counts only time above this state of charge — the top of the
+/// longevity band, percent — plus the hysteresis margin.
 pub const DWELL_SOC_PCT: f64 = 80.0;
+
+/// Hysteresis above [`DWELL_SOC_PCT`]: how far past the band top a sample
+/// must sit before it counts as high-charge dwell. A correctly capped
+/// machine (the common cap sits exactly at 80) jitters around its cap and
+/// must accrue nothing; overshoot past the cap is bounded by this margin,
+/// so the persisted total cannot creep up forever on healthy behaviour and
+/// pin the benchmark factor at its floor.
+pub const DWELL_HYSTERESIS_PCT: f64 = 2.0;
+
+/// The dwell threshold proper: [`DWELL_SOC_PCT`] + [`DWELL_HYSTERESIS_PCT`].
+/// Every consumer of the convention (benchmark detail, daily record, digest
+/// wording) reads this, never a copied constant.
+pub fn dwell_threshold() -> f64 {
+    DWELL_SOC_PCT + DWELL_HYSTERESIS_PCT
+}
 
 /// A single interval credits at most this many seconds. The 1 Hz stream
 /// normally ticks 1 s apart, so this only binds on a stall (machine asleep,
@@ -39,7 +61,9 @@ pub fn dwell_credit(prev_s: Option<f64>, now_s: f64, s: &BatterySample) -> f64 {
     if now_s <= prev {
         return 0.0;
     }
-    let at_or_above = s.state_of_charge.is_some_and(|soc| soc >= DWELL_SOC_PCT);
+    let at_or_above = s
+        .state_of_charge
+        .is_some_and(|soc| soc >= dwell_threshold());
     if !(at_or_above && plugged_in(s.charging_state)) {
         return 0.0;
     }
@@ -122,5 +146,39 @@ mod tests {
         assert_eq!(dwell_credit(Some(0.0), 1.0, &no_soc), 0.0);
         let no_state = sample(Some(95.0), None);
         assert_eq!(dwell_credit(Some(0.0), 1.0, &no_state), 0.0);
+    }
+
+    /// Re-audit N3: a machine correctly capped at exactly 80% — held there
+    /// on AC forever — accrues nothing. Dwell is excess above the cap
+    /// behaviour, not the hold itself; only past the hysteresis margin
+    /// (82%) does the clock run again.
+    #[test]
+    fn held_at_the_cap_itself_credits_nothing_excess_does() {
+        // Exactly at an 80% cap, on AC, for ten seconds: no dwell.
+        let mut total = 0.0;
+        let mut prev = None;
+        for t in 0..10 {
+            let s = sample(Some(DWELL_SOC_PCT), Some(ChargingState::OnAcNotCharging));
+            total += dwell_credit(prev, t as f64, &s);
+            prev = Some(t as f64);
+        }
+        assert_eq!(total, 0.0);
+
+        // Inside the hysteresis band (the common firmware overshoot):
+        // still no dwell.
+        let s = sample(Some(DWELL_SOC_PCT + 1.0), Some(ChargingState::Charging));
+        assert_eq!(dwell_credit(prev, 10.0, &s), 0.0);
+
+        // Past the margin, dwell resumes — an uncapped machine parked at
+        // 100% keeps scoring exactly as it did before. The interval since
+        // the last sample (t=9) is credited when the current sample
+        // qualifies, the convention the stream has always used.
+        let s = sample(
+            Some(dwell_threshold()),
+            Some(ChargingState::OnAcNotCharging),
+        );
+        assert_eq!(dwell_credit(prev, 11.0, &s), 2.0);
+        let full = sample(Some(100.0), Some(ChargingState::Full));
+        assert_eq!(dwell_credit(Some(11.0), 21.0, &full), 10.0);
     }
 }
