@@ -15,8 +15,8 @@ pub fn module() -> MakerModule {
         },
         cap_guidance: Some(SettingGuidance {
             tool: "MyASUS",
-            steps: "Open MyASUS → Hardware settings → Battery Health Charging and pick Best for \
-                    battery (60%) or Balanced (80%)",
+            steps: "Open MyASUS → Device Settings → Battery Care Settings (Battery Health \
+                    Charging) and pick Maximum Lifespan Mode (60%) or Balanced Mode (80%)",
             url: None,
         }),
         adaptive_guidance: None,

@@ -70,17 +70,41 @@ fn remove_path(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
+/// Quote a string for a PowerShell command line: a single-quoted literal
+/// with the quote doubled. PowerShell has no backslash escaping inside
+/// single quotes — the POSIX `'\''` form the Windows branch used to emit
+/// breaks any path containing an apostrophe (re-audit N11a).
+#[cfg(any(target_os = "windows", test))]
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The full copyable removal command for a Windows install: delete the
+/// binary, then delete the toast AUMID registry key the app created at
+/// `HKCU\SOFTWARE\Classes\AppUserModelId\Battery Viz` (re-audit N11b —
+/// an uninstall that leaves the key behind leaves a ghost toast sender).
+/// Pure so fixture tests can run it on every host.
+#[cfg(any(target_os = "windows", test))]
+fn windows_removal_command(exe: &str, aumid_key_ps: &str) -> String {
+    format!(
+        "Remove-Item {}; Remove-Item -Path {}",
+        ps_quote(exe),
+        ps_quote(aumid_key_ps)
+    )
+}
+
 /// The copyable command that removes the app binary — shown to the person,
-/// never executed by the app. `rm -f` on macOS/POSIX, `Remove-Item` on
-/// Windows; single-quoted with POSIX `'\''` escaping.
+/// never executed by the app. `rm -f` on macOS/POSIX; on Windows a
+/// PowerShell line that also removes the AUMID registry key the app
+/// registered for toasts.
 pub fn removal_command(exe: &str) -> String {
-    let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
     #[cfg(target_os = "windows")]
     {
-        format!("Remove-Item {quoted}")
+        windows_removal_command(exe, &crate::notify::windows::aumid_key_ps())
     }
     #[cfg(not(target_os = "windows"))]
     {
+        let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
         format!("rm -f {quoted}")
     }
 }
@@ -213,5 +237,30 @@ mod tests {
             "rm -f '/opt/App/battery-viz'"
         );
         assert_eq!(removal_command("/opt/my'app"), "rm -f '/opt/my'\\''app'");
+    }
+
+    // N11a: the Windows removal command runs under PowerShell, so its
+    // quoting must be PowerShell's (doubled single quotes), not POSIX
+    // backslash-escaping. Pure helpers, so these run on every host.
+    #[test]
+    fn windows_removal_command_uses_powershell_quoting_and_removes_the_aumid_key() {
+        let cmd = windows_removal_command(
+            r"C:\Apps\battery-viz.exe",
+            r"HKCU:\SOFTWARE\Classes\AppUserModelId\Battery Viz",
+        );
+        assert_eq!(
+            cmd,
+            "Remove-Item 'C:\\Apps\\battery-viz.exe'; Remove-Item -Path \
+             'HKCU:\\SOFTWARE\\Classes\\AppUserModelId\\Battery Viz'"
+        );
+    }
+
+    #[test]
+    fn powershell_quoting_doubles_embedded_quotes() {
+        assert_eq!(
+            ps_quote("C:\\my'app\\battery-viz.exe"),
+            "'C:\\my''app\\battery-viz.exe'"
+        );
+        assert_eq!(ps_quote("plain path.exe"), "'plain path.exe'");
     }
 }

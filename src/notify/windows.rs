@@ -13,7 +13,14 @@ use std::os::windows::process::CommandExt;
 /// The AppUserModelId toasts are shown under. Windows suppresses unpackaged
 /// WinRT toasts from an unregistered AUMID, so this is registered (per-user,
 /// idempotent) before the first toast can fire.
-const AUMID: &str = "Battery Viz";
+pub(crate) const AUMID: &str = "Battery Viz";
+
+/// The registry key holding the AUMID registration, in PowerShell's
+/// drive-qualified form — the uninstall removal command deletes exactly
+/// this key (re-audit N11b).
+pub(crate) fn aumid_key_ps() -> String {
+    format!(r"HKCU:\SOFTWARE\Classes\AppUserModelId\{AUMID}")
+}
 
 /// Register the AUMID once per run: `HKCU\SOFTWARE\Classes\AppUserModelId\
 /// Battery Viz` with a DisplayName. Runs detached; failures surface through
@@ -109,11 +116,17 @@ mod tests {
     fn toast_script_embeds_escaped_text() {
         let s = toast_script("Battery Viz", "it's hot; unplug");
         assert!(s.contains("'Battery Viz'"));
-        assert!(s.contains("'it''s hot; unplug'"), "single quotes must be doubled");
+        assert!(
+            s.contains("'it''s hot; unplug'"),
+            "single quotes must be doubled"
+        );
         assert!(s.contains("ToastText02"));
         // The toast is built from the template document `$t`, and the
         // notification is created from that same document.
         assert!(s.contains("::new($t)"));
-        assert!(!s.contains("$x.Owner"), "text nodes must come from $t, not a bogus Owner");
+        assert!(
+            !s.contains("$x.Owner"),
+            "text nodes must come from $t, not a bogus Owner"
+        );
     }
 }

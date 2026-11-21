@@ -5,7 +5,7 @@ Cross-platform Rust desktop app: battery telemetry (macOS ioreg, Windows WMI/CIM
 ## Commands
 
 - Build: `cargo build`
-- Merge gate: `scripts/verify.sh` — runs `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test --all-targets`, then prints a paste-ready summary (test counts + head SHA). Measured 2026-11-20: 51 tests passing; `cargo fmt --check` currently fails (pre-existing, tree-wide adoption of the gate is deferred to a later PR so in-flight feature branches are not reformatted); clippy reports dead-code warnings for fixture-only collector functions. There is no CI (GitHub Actions is disabled at the account level and intentionally unused).
+- Merge gate: `scripts/verify.sh` — runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`, then prints a paste-ready summary (test counts + head SHA). Measured 2026-11-21 (re-audit wave 3): 251 tests passing; all three gates are HARD — fmt drift and any clippy warning fail the script. The one-time tree-wide `cargo fmt` landed in the wave-3 PR, so drift after it fails the gate. The known cross-platform dead-code warnings (fixture-only macOS parser, Windows-written-but-unread sample fields, platform-only notify recorder) are allowlisted in source with `// Allowlist (M3 lint gate): …` comments — do not add allowlists in the script. There is no CI (GitHub Actions is disabled at the account level and intentionally unused); the local run is the gate.
 - Run: `cargo run` — opens the dashboard; simulator runs on any host, macOS uses live ioreg.
 
 ## Merge policy (project-specific, overrides workspace ki_TMZLlmkE)

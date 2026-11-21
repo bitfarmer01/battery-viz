@@ -563,10 +563,11 @@ mod tests {
         // End-to-end through build: pre-reset readings share the window
         // with post-reset ones; the contributor is omitted rather than
         // printed as a measurement.
-        let mut record = DailyRecord::default();
-        record.rows = (0..7)
-            .map(|i| row(i, Some(if i < 4 { 296 } else { 5 }), 97.0))
-            .collect();
+        let record = DailyRecord {
+            rows: (0..7)
+                .map(|i| row(i, Some(if i < 4 { 296 } else { 5 }), 97.0))
+                .collect(),
+        };
         let outcomes = OutcomeStore::new();
         let digest =
             WeeklyDigest::build(digest_inputs(&record, &outcomes, 6)).expect("week has data");
@@ -583,8 +584,9 @@ mod tests {
 
     #[test]
     fn digest_counts_cycles_when_the_counter_rises_all_week() {
-        let mut record = DailyRecord::default();
-        record.rows = (0..7).map(|i| row(i, Some(100 + i * 3), 97.0)).collect();
+        let record = DailyRecord {
+            rows: (0..7).map(|i| row(i, Some(100 + i * 3), 97.0)).collect(),
+        };
         let outcomes = OutcomeStore::new();
         let digest =
             WeeklyDigest::build(digest_inputs(&record, &outcomes, 6)).expect("week has data");
@@ -595,8 +597,9 @@ mod tests {
     fn soh_endpoints_follow_the_day_not_the_row_order() {
         // Advisory-2: rows deliberately out of day order; the fade pair
         // must still be earliest-day → latest-day, not first-row → last-row.
-        let mut record = DailyRecord::default();
-        record.rows = vec![row(2, None, 96.0), row(0, None, 98.0), row(1, None, 97.5)];
+        let record = DailyRecord {
+            rows: vec![row(2, None, 96.0), row(0, None, 98.0), row(1, None, 97.5)],
+        };
         let outcomes = OutcomeStore::new();
         let digest =
             WeeklyDigest::build(digest_inputs(&record, &outcomes, 2)).expect("week has data");

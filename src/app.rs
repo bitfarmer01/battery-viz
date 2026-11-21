@@ -513,6 +513,13 @@ impl App {
                 }
             })
             .collect();
+        // Re-audit Low 3: a successfully collected sample is a success —
+        // the error banner clears instead of sticking until restart. Errors
+        // raised further down this tick (a failed persist, for instance)
+        // are set after this point and stay visible.
+        if !samples.is_empty() {
+            self.last_error = None;
+        }
         // Uninstall confirmed: the channel is still drained (no backlog)
         // but nothing is recorded or alerted — a dead sampler must not
         // re-write history mid-delete. Stop-then-delete ordering.
@@ -733,6 +740,13 @@ impl App {
         !matches!(self.cap_monitor.status(), capdetect::CapStatus::Capped)
     }
 
+    /// The header error banner's dismiss control (re-audit Low 3): the
+    /// person can clear a stale error without restarting. A still-failing
+    /// condition simply re-sets it on a later tick.
+    pub fn dismiss_error(&mut self) {
+        self.last_error = None;
+    }
+
     /// Open the in-app confirm panel. No deletion happens here.
     pub fn request_uninstall(&mut self) {
         self.uninstall_requested = true;
@@ -903,26 +917,39 @@ impl App {
             return;
         }
         self.full_charge_advice = self.adaptive_advice.clone();
-        // Mark at raise, not at dismiss: the once-ever contract is "shown at
-        // most one time ever", so quitting with the card up must not re-show
-        // it on the next launch. Dismissal is purely the hide-now case.
-        self.mark_full_charge_advice_shown();
+        // Re-audit Low 1: NOT marked here. The raise is a data-level event
+        // that also fires while the window is hidden (menu-bar agent mode
+        // renders no frames) — marking at raise would burn the once-ever
+        // card on a session where it was never on screen. The once-ever
+        // flag is persisted by the card's render path
+        // (`note_full_charge_advice_rendered`) and, idempotently, by the
+        // dismiss button.
     }
 
     /// What the advice card's dismiss button does: persist the once-ever flag
-    /// (idempotent — the raise already marked it) before the card leaves the
-    /// UI, so a crash or a failed write can never lose a said advice, then
-    /// take the card down for the rest of the session.
+    /// (idempotent — the render path already marked it) before the card
+    /// leaves the UI, so a crash or a failed write can never lose a said
+    /// advice, then take the card down for the rest of the session.
     pub fn dismiss_full_charge_advice(&mut self) {
         self.mark_full_charge_advice_shown();
         self.full_charge_advice = None;
     }
 
-    /// Record that the FR-5 advice has been said: called the moment the card
-    /// is raised, persisting the flag so it is never said again (even across
-    /// restarts — quitting with the card up counts as having seen it) and
-    /// stopping recomputes. The card itself stays up for the session until
-    /// dismissed.
+    /// Called by the card's render path every frame it is painted
+    /// (re-audit Low 1): the once-ever flag is earned by an actual render,
+    /// not by the detector firing. Hidden agent mode draws no frames, so a
+    /// card raised there stays "unsaid" until the window is shown and the
+    /// card is actually painted. Idempotent.
+    pub fn note_full_charge_advice_rendered(&mut self) {
+        self.mark_full_charge_advice_shown();
+    }
+
+    /// Record that the FR-5 advice has been said: called from the card's
+    /// render path the first frame it is painted (and idempotently by the
+    /// dismiss button), persisting the flag so it is never said again (even
+    /// across restarts — quitting with a rendered card up counts as having
+    /// seen it) and stopping recomputes. The card itself stays up for the
+    /// session until dismissed.
     pub fn mark_full_charge_advice_shown(&mut self) {
         if self.advice_shown {
             return;
@@ -994,6 +1021,13 @@ impl App {
         std::fs::write(&path, self.history_store.to_csv())
             .map_err(|e| format!("write CSV: {e}"))?;
         Ok(path)
+    }
+
+    /// Re-audit Low 4: once uninstall has run, every data-export action is
+    /// disabled — an Export CSV after the wipe would silently recreate
+    /// files the person just deleted.
+    pub fn exports_disabled(&self) -> bool {
+        self.uninstall_results.is_some()
     }
 
     /// Wake interval for eframe. Both modes wake at the DATA cadence
@@ -1579,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn raising_the_advice_persists_the_shown_state_even_if_the_app_quits() {
+    fn rendering_the_advice_persists_the_shown_state_even_if_the_app_quits() {
         let dir = tagged_dir("advice-raise");
         let path = dir.join("history.json");
         let mut app = app_at(Some(path.clone()));
@@ -1591,23 +1625,37 @@ mod tests {
             "detector fires before the quit"
         );
 
-        // Quit right here — no dismissal. The once-ever contract is
-        // "shown at most one time ever", so the raise itself must have
-        // persisted the flag: a restart may not re-show the card.
-        assert!(app.advice_shown, "marked at raise, not at dismiss");
+        // Re-audit Low 1: the raise alone marks nothing — a hidden window
+        // (menu-bar agent mode) renders no frames, so a card that was never
+        // on screen must survive as "not said" for the next launch.
+        assert!(!app.advice_shown, "raised but not rendered — not yet said");
+        assert!(
+            !dir.join("advice-state.json").exists(),
+            "no once-ever flag persisted at raise"
+        );
+
+        // Quit right here (no render, no dismissal): the card comes back
+        // next launch, which is the point of render-time marking.
+        app.save_history_now();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut restarted = App::with_history_path(rx, Some(path.clone()));
+        assert!(
+            !restarted.advice_shown,
+            "an unrendered card is not a said card"
+        );
+
+        // Rendering the card — what the UI calls on every painted frame —
+        // is what earns the once-ever flag. Quit immediately after: the
+        // flag must already be on disk.
+        restarted.adaptive_advice = Some(unsaid_advice());
+        restarted.history_store.buckets = deep_discharge_buckets();
+        restarted.recompute_full_charge_advice();
+        restarted.note_full_charge_advice_rendered();
+        assert!(restarted.advice_shown, "marked at first render");
         assert_eq!(
             std::fs::read_to_string(dir.join("advice-state.json")).unwrap(),
             ADVICE_SHOWN_MARKER,
-            "once-ever flag persisted at raise"
-        );
-
-        app.save_history_now();
-        let (_tx, rx) = crossbeam_channel::unbounded();
-        let restarted = App::with_history_path(rx, Some(path));
-        assert!(restarted.advice_shown, "flag survives the quit");
-        assert!(
-            restarted.full_charge_advice.is_none(),
-            "pattern still in the window, but the advice was said once ever"
+            "once-ever flag persisted at render"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

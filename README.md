@@ -8,7 +8,7 @@ optimization benchmark, rendered with egui on **wgpu** (GPU, no idle stall).
 
 ```sh
 cargo run            # run the dashboard (simulator on non macOS/Windows hosts)
-cargo test --all-targets   # 51 unit tests: parsers, model, benchmark, alerts
+cargo test --all-targets   # 251 unit tests: parsers, model, benchmark, alerts
 ```
 
 ## Alerts — battery-longevity coaching

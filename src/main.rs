@@ -19,6 +19,7 @@ mod digest;
 mod dwell;
 mod first_run;
 mod history;
+mod instance;
 mod notify;
 mod outcomes;
 mod record;
@@ -29,6 +30,18 @@ mod warm;
 use eframe::egui::ViewportBuilder;
 
 fn main() -> eframe::Result<()> {
+    // Single-instance guard (re-audit Low 6): a second instance would race
+    // the first on the same history and record files. Losing the lock ends
+    // this instance before any window comes up — the first one is already
+    // on screen.
+    let _instance_guard = match instance::acquire(&instance::lock_path()) {
+        Ok(guard) => guard,
+        Err(reason) => {
+            eprintln!("Battery Viz: {reason}");
+            return Ok(());
+        }
+    };
+
     let rx = collect::spawn_collector(caps::platform_collector());
 
     // Menu-bar agent mode: hidden at launch. `BATTERY_VIZ_START_HIDDEN`

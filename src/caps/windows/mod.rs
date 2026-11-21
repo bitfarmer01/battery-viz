@@ -154,31 +154,74 @@ impl Capabilities for WindowsCapabilities {
 
 /// The daily rows of `powercfg /batteryreport`'s "Battery capacity history"
 /// table: one `SeedCapacity` per dated row, SoH = full-charge over design.
-/// Rows that do not parse (different tool version, empty report) are
-/// skipped, never guessed.
+/// Real reports (verified against a captured Windows 10 report; see PR):
+/// the heading is title-case, `<tr>`/`<td>` tags can carry class attributes,
+/// PERIOD cells are ISO `YYYY-MM-DD` dates — a weekly range or a single
+/// day, not the US `M/D/YYYY` the first parser version expected — and
+/// capacity figures carry a ` mWh` suffix with a locale-dependent thousands
+/// separator (`,` US, `.` de, space/nbsp fr). The parser is tolerant of all
+/// of it; rows that still do not parse are skipped, never guessed.
 pub fn parse_battery_report(html: &str) -> Vec<SeedCapacity> {
-    let Some(start) = html.find("Battery capacity history") else {
+    // ASCII-lowercased probe for the heading (case-insensitive without
+    // shifting byte offsets), but slice the ORIGINAL so header cells keep
+    // their case for the column detection below.
+    let Some(start) = html.to_ascii_lowercase().find("battery capacity history") else {
         return Vec::new();
     };
     let rest = &html[start..];
     let table = &rest[..rest.find("</table>").unwrap_or(rest.len())];
+
+    // Column positions from the header row when one is present (real
+    // reports carry `PERIOD | FULL CHARGE CAPACITY | DESIGN CAPACITY`);
+    // with no recognizable header, fall back to the positional layout
+    // (the date leads, then the two figures).
+    let mut full_col: Option<usize> = None;
+    let mut design_col: Option<usize> = None;
+
     let mut out = Vec::new();
-    for chunk in table.split("<tr>").skip(1) {
-        let cells: Vec<&str> = chunk
-            .split("<td>")
-            .skip(1)
-            .map(|c| c.split("</td>").next().unwrap_or("").trim())
-            .collect();
-        // Row shape: the date leads, then the capacity figures (with
-        // thousands separators). Extra columns are ignored.
-        let Some(day) = cells.first().and_then(|c| parse_report_date(c)) else {
+    for chunk in table.split("<tr").skip(1) {
+        let cells = row_cells(chunk);
+        let lower: Vec<String> = cells.iter().map(|c| c.to_ascii_lowercase()).collect();
+        if let Some(f) = lower
+            .iter()
+            .position(|c| c.contains("full charge capacity"))
+        {
+            full_col = Some(f);
+            design_col = lower.iter().position(|c| c.contains("design capacity"));
+            continue; // header row, not data
+        }
+        // The PERIOD cell is the first cell that parses as a date; the
+        // figures follow it. A weekly-range cell (`2019-06-03 -
+        // 2019-06-10`) parses to its leading day.
+        let Some((day_idx, day)) = cells
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| parse_report_date(c).map(|d| (i, d)))
+        else {
             continue;
         };
-        let nums: Vec<f64> = cells[1..].iter().filter_map(|c| parse_capacity(c)).collect();
-        if nums.len() < 2 || nums[1] <= 0.0 {
+        let parsed = match (full_col, design_col) {
+            (Some(f), Some(d)) if f > day_idx && d > day_idx => {
+                (parse_capacity(&cells[f]), parse_capacity(&cells[d]))
+            }
+            // No header seen: first two numeric cells after the date.
+            _ => {
+                let nums: Vec<f64> = cells[day_idx + 1..]
+                    .iter()
+                    .filter_map(|c| parse_capacity(c))
+                    .collect();
+                if nums.len() < 2 {
+                    continue;
+                }
+                (Some(nums[0]), Some(nums[1]))
+            }
+        };
+        let (Some(full), Some(design)) = parsed else {
+            continue;
+        };
+        if design <= 0.0 {
             continue;
         }
-        let (full, design) = (nums[0], nums[1]);
         out.push(SeedCapacity {
             day,
             soh_pct: 100.0 * full / design,
@@ -187,18 +230,64 @@ pub fn parse_battery_report(html: &str) -> Vec<SeedCapacity> {
     out
 }
 
-/// `M/D/YYYY` (the report's PERIOD format) as days since the Unix epoch.
+/// The text of every `<td>`/`<th>` cell in one `<tr>` chunk (the chunk
+/// starts after `<tr`, which may itself carry attributes). Attribute
+/// variants like `<td class="mw">` are handled by skipping to the tag's
+/// closing `>`; malformed cells yield what is there.
+fn row_cells(row_chunk: &str) -> Vec<String> {
+    row_chunk
+        .split("<td")
+        .chain(row_chunk.split("<th").skip(1))
+        .skip(1)
+        .filter_map(|c| {
+            let after_tag = c.split_once('>')?.1;
+            let text = after_tag.split("</").next().unwrap_or("");
+            Some(text.trim().to_string())
+        })
+        .collect()
+}
+
+/// The report's PERIOD cell as days since the Unix epoch. Real reports use
+/// ISO `YYYY-MM-DD` — a single day or the leading end of a weekly range
+/// (`2019-06-03 - 2019-06-10`), possibly with a trailing time; older
+/// locale-rendered reports use `M/D/YYYY`. Whichever shape, the leading
+/// date wins.
 fn parse_report_date(s: &str) -> Option<u32> {
-    let mut it = s.trim().split('/');
+    let t = s.trim();
+    let bytes = t.as_bytes();
+    // ISO: dddd-dd-dd (leading 10 chars of "2019-06-03 …").
+    if t.len() >= 10 && bytes[4] == b'-' && bytes[7] == b'-' {
+        if let (Ok(year), Ok(month), Ok(day)) = (
+            t[..4].parse::<i64>(),
+            t[5..7].parse::<u32>(),
+            t[8..10].parse::<u32>(),
+        ) {
+            if let Some(day_num) = days_from_civil(year, month, day) {
+                return Some(day_num);
+            }
+        }
+    }
+    // US fallback: M/D/YYYY.
+    let mut it = t.split('/');
     let month: u32 = it.next()?.trim().parse().ok()?;
     let day: u32 = it.next()?.trim().parse().ok()?;
     let year: i64 = it.next()?.trim().parse().ok()?;
     days_from_civil(year, month, day)
 }
 
-/// Strip thousands separators and parse a capacity figure.
+/// Parse a capacity figure: integer mWh with a locale-dependent thousands
+/// separator (`,` US, `.` de, space/nbsp fr, `'` ch) and an optional
+/// `mWh` suffix. Digits survive; everything else is separator or noise —
+/// a cell that is not a figure parses to `None` and the row is skipped.
 fn parse_capacity(s: &str) -> Option<f64> {
-    s.replace(',', "").trim().parse::<f64>().ok()
+    let digits: String = s
+        .trim()
+        .trim_end_matches("mWh")
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<f64>().ok()
 }
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's
@@ -333,7 +422,11 @@ mod tests {
     #[test]
     fn battery_report_capacity_history_becomes_seed_rows() {
         let seeds = parse_battery_report(REPORT_FIXTURE);
-        assert_eq!(seeds.len(), 2, "header and non-date rows skipped; later tables excluded");
+        assert_eq!(
+            seeds.len(),
+            2,
+            "header and non-date rows skipped; later tables excluded"
+        );
         assert_eq!(seeds[0].day, days_from_civil(2026, 11, 18).unwrap());
         assert!((seeds[0].soh_pct - 100.0 * 44_900.0 / 50_000.0).abs() < 1e-9);
         assert!((seeds[1].soh_pct - 100.0 * 44_700.0 / 50_000.0).abs() < 1e-9);
@@ -345,6 +438,48 @@ mod tests {
         assert!(parse_battery_report("").is_empty());
     }
 
+    // N11c: the shapes a REAL report has (verified against a captured
+    // Windows 10 report): class attributes on tr/td, ISO PERIOD dates
+    // (weekly ranges and single days), ` mWh` suffixes, and a
+    // dot-as-thousands-separator locale. The first parser version
+    // (bare `<td>` tags, US dates, comma separators) matched none of it.
+    const REAL_REPORT_FIXTURE: &str = r#"<html><body>
+    <h2>Battery capacity history</h2>
+    <table>
+    <tr class="label"><th>PERIOD </th><th>FULL CHARGE CAPACITY </th><th>DESIGN CAPACITY </th></tr>
+    <tr class="even"><td>2019-06-03
+    - 2019-06-10</td><td class="mw">37.318 mWh</td><td class="mw">38.152 mWh</td></tr>
+    <tr class="odd"><td>2019-09-16</td><td class="mw">35.452 mWh</td><td class="mw">38.152 mWh</td></tr>
+    <tr class="even"><td colspan="3">no row here</td></tr>
+    </table>
+    <h2>Battery life estimates</h2><table>
+    <tr><th>PERIOD</th><th>FULL CHARGE CAPACITY</th><th>DESIGN CAPACITY</th></tr>
+    <tr><td>2019-09-28</td><td class="mw">1 mWh</td><td class="mw">2 mWh</td></tr>
+    </table>
+    </body></html>"#;
+
+    #[test]
+    fn real_report_shapes_parse_with_iso_dates_and_locale_figures() {
+        let seeds = parse_battery_report(REAL_REPORT_FIXTURE);
+        assert_eq!(
+            seeds.len(),
+            2,
+            "header and non-date rows skipped; later tables excluded"
+        );
+        assert_eq!(
+            seeds[0].day,
+            days_from_civil(2019, 6, 3).unwrap(),
+            "weekly range → leading day"
+        );
+        assert_eq!(
+            seeds[1].day,
+            days_from_civil(2019, 9, 16).unwrap(),
+            "single ISO day"
+        );
+        assert!((seeds[0].soh_pct - 100.0 * 37_318.0 / 38_152.0).abs() < 1e-9);
+        assert!((seeds[1].soh_pct - 100.0 * 35_452.0 / 38_152.0).abs() < 1e-9);
+    }
+
     #[test]
     fn report_dates_map_to_epoch_days() {
         assert_eq!(days_from_civil(1970, 1, 1), Some(0));
@@ -352,6 +487,24 @@ mod tests {
         assert_eq!(days_from_civil(2024, 2, 29), Some(19_782), "leap day");
         assert_eq!(days_from_civil(2026, 13, 1), None);
         assert_eq!(days_from_civil(2026, 0, 1), None);
-        assert_eq!(parse_report_date("1/5/2026"), parse_report_date("01/05/2026"));
+        assert_eq!(
+            parse_report_date("1/5/2026"),
+            parse_report_date("01/05/2026")
+        );
+        // N11c: real reports lead with ISO dates (single day or a weekly
+        // range's first end).
+        assert_eq!(
+            parse_report_date("2019-06-03"),
+            parse_report_date("06/03/2019")
+        );
+        assert_eq!(
+            parse_report_date("2019-06-03 - 2019-06-10"),
+            parse_report_date("2019-06-03")
+        );
+        assert_eq!(
+            parse_report_date("2019-06-03 08:00:00"),
+            parse_report_date("2019-06-03"),
+            "trailing time ignored"
+        );
     }
 }

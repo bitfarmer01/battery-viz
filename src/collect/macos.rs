@@ -59,6 +59,10 @@ impl Collector for MacCollector {
 }
 
 /// Parse the XML plist emitted by ioreg into a sample.
+// Allowlist (M3 lint gate): on non-macOS builds the only caller is the
+// cfg(target_os = "macos") collector in this file, so the parser reads as
+// dead there. It is exercised by this file's fixture tests on every host.
+#[allow(dead_code)]
 pub fn parse_ioreg_plist(xml: &[u8]) -> Result<BatterySample, String> {
     let value: plist::Value = plist::Value::from_reader(Cursor::new(xml))
         .map_err(|e| format!("ioreg plist parse: {e}"))?;

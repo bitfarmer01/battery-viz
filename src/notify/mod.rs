@@ -17,6 +17,10 @@ use std::sync::Mutex;
 /// why the OS did not.
 static NOTIFY_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
+// Allowlist (M3 lint gate): called only from the cfg-gated platform
+// notification backends (macOS/Windows); it is never reachable from a
+// host where those modules do not compile.
+#[allow(dead_code)]
 pub(crate) fn record_notify_error(message: String) {
     if let Ok(mut slot) = NOTIFY_ERROR.lock() {
         *slot = Some(message);
