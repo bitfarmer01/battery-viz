@@ -259,6 +259,34 @@ pub fn platform_collector() -> Box<dyn Collector> {
     }
 }
 
+/// Open a guidance deep link with the platform's URL handler. Platform
+/// logic lives here in the capability layer, never in features (FR-0 rule).
+/// URLs come only from adapter constants, never user input.
+pub fn open_guidance_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("open {url}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
