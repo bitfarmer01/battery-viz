@@ -706,6 +706,15 @@ impl App {
     pub fn set_alerts_paused(&mut self, paused: bool) {
         if self.alerts_paused != paused {
             self.alerts_paused = paused;
+            if !paused {
+                // Re-audit N4b: re-enabling alerts is user action — a
+                // retirement (or ignore streak) earned before the pause
+                // gets a fresh start. Persisted daily caps and cooldowns
+                // are kept: un-muting must not buy a duplicate
+                // notification for a condition already coached today.
+                self.outcomes.reactivate_all();
+                self.save_outcomes_now();
+            }
             let charge_coaching = self.alert_engine_charge_coaching_enabled();
             self.alert_engine = AlertEngine::new();
             self.alert_engine
@@ -1785,6 +1794,101 @@ mod tests {
             app.outcomes,
             OutcomeStore::new(),
             "starts fresh, never silent"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Re-audit N4: restart stability, recoverable retirement -------------
+
+    #[test]
+    fn restarts_plugged_in_do_not_double_fire_or_retire_the_band_coach() {
+        let dir = tagged_dir("fr6-n4-restarts");
+        let path = dir.join("history.json");
+        let t = 1_000_000i64;
+        let mut last_rate = None;
+        // Three sessions, each plugged in at 90% minutes after the last.
+        // Only the very first delivers: the persisted daily cap re-applies
+        // to every fresh engine afterwards, so no duplicate notification
+        // and no manufactured Ignored — and no retirement builds up.
+        for restart in 0..3i64 {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let mut app = App::with_history_path(rx, Some(path.clone()));
+            app.test_clock = Some(pinned_clock(20_000, t + restart * 60));
+            tx.send(Ok(plugged_in(90.0))).unwrap();
+            app.update();
+            assert_eq!(
+                app.last_alert.map(|a| a.kind),
+                (restart == 0).then_some(AlertKind::BandCoach),
+                "restart {restart}: only the first session delivers"
+            );
+            assert!(
+                !app.outcomes.is_retired(AlertKind::BandCoach),
+                "restart {restart}: the coach must never retire"
+            );
+            last_rate = app
+                .outcomes
+                .acted_on_rate(AlertKind::BandCoach, (t + 180) as u64)
+                .map(|(_, total)| total);
+        }
+        assert_eq!(
+            last_rate,
+            Some(1),
+            "exactly one delivered fire across three sessions"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unpausing_clears_retirements_and_a_spent_daily_cap_still_limits_today() {
+        let dir = tagged_dir("fr6-n4-unpause");
+        let path = dir.join("history.json");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, Some(path.clone()));
+        app.outcomes = OutcomeStore::with_retire_after(1);
+
+        // Retire the band coach: fire, then let the window expire ignored.
+        app.test_clock = Some(pinned_clock(20_000, 1_000_000));
+        tx.send(Ok(plugged_in(90.0))).unwrap();
+        app.update();
+        app.test_clock = Some(pinned_clock(20_000, 1_000_000 + OUTCOME_WINDOW_S as i64));
+        tx.send(Ok(plugged_in(90.0))).unwrap();
+        app.update();
+        assert!(app.outcomes.is_retired(AlertKind::BandCoach));
+
+        // The user mutes, then re-enables: retirement cleared by user
+        // action. Today's daily cap is still spent, so the fresh engine's
+        // re-fire is gated — no duplicate notification today.
+        app.set_alerts_paused(true);
+        app.set_alerts_paused(false);
+        assert!(
+            !app.outcomes.is_retired(AlertKind::BandCoach),
+            "re-enabling clears the retirement"
+        );
+        app.last_alert = None; // sticky banner: clear before, so the assert sees only new fires
+        tx.send(Ok(plugged_in(90.0))).unwrap();
+        app.update();
+        assert_eq!(
+            app.last_alert.map(|a| a.kind),
+            None,
+            "the spent daily cap still limits today"
+        );
+
+        // Tomorrow, with the condition having ended (unplugged overnight)
+        // and recurred, the coach fires again.
+        app.test_clock = Some(pinned_clock(20_001, 1_000_000 + 86_400));
+        tx.send(Ok(crate::collect::BatterySample {
+            state_of_charge: Some(70.0),
+            charging_state: Some(ChargingState::Discharging),
+            ..Default::default()
+        }))
+        .unwrap();
+        app.update();
+        tx.send(Ok(plugged_in(90.0))).unwrap();
+        app.update();
+        assert_eq!(
+            app.last_alert.map(|a| a.kind),
+            Some(AlertKind::BandCoach),
+            "the next day it fires again"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
