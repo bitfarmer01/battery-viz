@@ -559,7 +559,7 @@ impl App {
             });
         match (stretch, self.cap_stretch_persisted) {
             (Some(s), last) => {
-                let due = last.map_or(true, |prev| {
+                let due = last.is_none_or(|prev| {
                     s.last_seen.saturating_sub(prev.last_seen) >= capdetect::STRETCH_PERSIST_SECS
                 });
                 if due && self.persist_cap_record(Some(s)) {
