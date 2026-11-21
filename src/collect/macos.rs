@@ -12,9 +12,10 @@
 
 use std::io::Cursor;
 use std::process::Command;
+use std::time::Duration;
 
-use crate::collect::Collector;
 use crate::collect::types::{BatterySample, ChargingState, ConditionFlag, SourceKind};
+use crate::collect::Collector;
 
 #[allow(dead_code)]
 pub struct MacCollector;
@@ -29,6 +30,16 @@ impl MacCollector {
 impl Collector for MacCollector {
     fn source(&self) -> SourceKind {
         SourceKind::MacIoreg
+    }
+
+    /// Re-audit N9: ioreg is a PROCESS LAUNCH per sample — at 1 Hz that is
+    /// ~86,400 spawns a day for telemetry that moves slowly. 5 s keeps the
+    /// alert engine's latency requirement intact: the sustained-heat alert
+    /// needs 60 s of ≥45 °C (HIGH_TEMP_SUSTAIN_S, delta-based between
+    /// ticks), which 5 s sampling still detects at ~60–65 s. Between
+    /// samples the last value holds — no interpolation, no invented data.
+    fn cadence(&self) -> Duration {
+        Duration::from_secs(5)
     }
 
     fn sample(&mut self) -> Result<BatterySample, String> {
@@ -85,10 +96,23 @@ pub fn parse_ioreg_plist(xml: &[u8]) -> Result<BatterySample, String> {
             .map(|v| v as u32)
     };
 
-    // Capacity: NominalChargeCapacity is the key Apple silicon emits;
-    // FullChargeCapacity is a tolerant fallback for Intel-era SMC layouts
-    // and is NOT assumed present on Apple silicon (re-audit N7).
-    let full_charge = get_f64("NominalChargeCapacity").or_else(|| get_f64("FullChargeCapacity"));
+    // Capacity (re-audit N10): ONE source for the SoH computation —
+    // AppleRawMaxCapacity is the pack's CURRENT full-charge capacity (the
+    // raw gauge, e.g. 84.9% of design on the audit Mac). NominalChargeCapacity
+    // is a firmware-nominal figure that reads higher on aged packs (87.7%
+    // on the same machine) and is only a fallback for machines that do not
+    // emit the raw key; FullChargeCapacity stays a tolerant Intel-era SMC
+    // fallback and is NOT assumed present on Apple silicon (re-audit N7).
+    // The exact key travels on the sample so the scorecard labels the
+    // figure by its real name.
+    let (full_charge, full_charge_key) = [
+        "AppleRawMaxCapacity",
+        "NominalChargeCapacity",
+        "FullChargeCapacity",
+    ]
+    .iter()
+    .find_map(|key| get_f64(key).map(|v| (Some(v), Some(*key))))
+    .unwrap_or((None, None));
 
     let temperature_c = get_f64("Temperature").map(|t| t / 100.0);
 
@@ -161,6 +185,7 @@ pub fn parse_ioreg_plist(xml: &[u8]) -> Result<BatterySample, String> {
             }),
         design_capacity: get_f64("DesignCapacity"),
         full_charge_capacity: full_charge,
+        full_charge_capacity_key: full_charge_key,
         // DesignCycleCount9C is the real Apple-silicon key (re-audit N7 —
         // CycleLimit does not exist on a measured MacBook Air M4).
         // CycleLimit stays a tolerant fallback for other machines; its

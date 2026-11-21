@@ -506,6 +506,8 @@ mod tests {
             cycles_last: cycles,
             high_n: 0,
             warm_n: 0,
+            high_s: 0.0,
+            warm_s: 0.0,
             soc_n: 0,
             soc_min: None,
             disch_n: 0,

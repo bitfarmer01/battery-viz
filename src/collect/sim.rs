@@ -32,6 +32,7 @@ impl Collector for SimCollector {
             state_of_charge: Some(soc),
             design_capacity: Some(58_030.0),
             full_charge_capacity: Some(53_300.0), // ~92% SoH
+            full_charge_capacity_key: Some("simulated"),
             cycle_limit: Some(1000),
             cycle_count: Some(187),
             temperature_c: Some(temp),

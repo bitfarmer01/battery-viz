@@ -30,6 +30,19 @@ pub const RETENTION_MINUTES: u64 = 7 * 24 * 60;
 /// margin, so clock jitter across restarts cannot evict fresh data.
 pub const MAX_BUCKETS: usize = RETENTION_MINUTES as usize + 480;
 
+/// Re-audit N6: a backward clock step this small is a plausible correction
+/// (NTP, manual fix-up) — its out-of-order buckets insert sorted and stay.
+/// A step larger than this folds the sample into the newest bucket instead:
+/// a wedged clock must not mint one stale bucket per minute and evict the
+/// real week from the front of the store.
+const BACKWARD_LOOKBACK_MINUTES: u64 = 60;
+
+/// Re-audit N6: consecutive normally-advancing samples needed to confirm a
+/// suspected clock era (see `HistoryStore::pending_era_minute`). Two
+/// samples arrive in about two seconds at the 1 Hz collection cadence —
+/// far inside any retention-relevant window.
+const ERA_CONFIRMATION_PUSHES: u32 = 2;
+
 /// On-disk schema version. Version 1 files still load (never quarantined);
 /// anything else unknown is corrupt. Version 2 exists because the N3
 /// re-audit changed the dwell rule: on first load of a v1 file, its
@@ -166,31 +179,103 @@ pub struct HistoryStore {
     /// first sample has been seen — an absent value is "never tracked", not
     /// zero, so the scorecard keeps its missing-data exclusion.
     pub dwell_s: Option<f64>,
+    /// Forward-jump suspicion (re-audit N6), not serialized: `Some(minute)`
+    /// while a sample arrived more than the retention window ahead of the
+    /// newest bucket and the new clock era is not yet corroborated. While
+    /// suspected, the retention cutoff does not fire (`MAX_BUCKETS` still
+    /// bounds growth), so one glitched clock reading cannot wipe the stored
+    /// week in a single step; two consecutive advancing samples confirm the
+    /// era and retention resumes. A correction back clears it at once.
+    pending_era_minute: Option<u64>,
+    /// Consecutive samples that have advanced normally inside the suspected
+    /// era (see `pending_era_minute`).
+    era_witnesses: u32,
 }
 
 impl HistoryStore {
     /// Fold one sample into its minute bucket. Returns true when a new
     /// bucket was created (the persistence checkpoint trigger).
+    ///
+    /// Clock steps (re-audit N6) are clamped against the last-seen minute:
+    /// a minute already recorded is reused, a small backward correction
+    /// inserts sorted, a far-backward step folds into the newest bucket
+    /// (never one out-of-order bucket per sample, never an eviction wave),
+    /// and a forward jump beyond the retention window collapses to one
+    /// bucket while the retention cutoff holds off until the new era is
+    /// corroborated — real history is never destroyed faster than the
+    /// retention rule would.
     pub fn push(&mut self, s: &BatterySample, unix_secs: u64) -> bool {
         let minute = unix_secs / 60;
+        let last_minute = self.buckets.last().map(|b| b.minute);
         let mut created = false;
         match self.buckets.last_mut() {
             // Common case: the live feed appends to the newest bucket.
-            Some(b) if b.minute == minute => b.add(s),
-            _ => {
-                let mut b = MinuteBucket::new(minute);
+            Some(b) if b.minute == minute => {
                 b.add(s);
+                self.witness_era(minute);
+            }
+            _ => {
                 // A clock step backwards across restarts lands out of order;
                 // keep the vector sorted by minute regardless.
                 let idx = self
                     .buckets
                     .partition_point(|existing| existing.minute < minute);
-                self.buckets.insert(idx, b);
-                created = true;
+                let revisited = idx < self.buckets.len() && self.buckets[idx].minute == minute;
+                let far_back = matches!(last_minute, Some(last) if last.saturating_sub(minute) > BACKWARD_LOOKBACK_MINUTES);
+                let jumped = matches!(last_minute, Some(last) if minute.saturating_sub(last) > RETENTION_MINUTES);
+                if revisited {
+                    // The clock revisits a minute already recorded: fold
+                    // into that bucket — never a duplicate row.
+                    self.buckets[idx].add(s);
+                } else if far_back {
+                    // A far-backward step: a wedged clock minting one
+                    // out-of-order bucket per minute would overflow
+                    // MAX_BUCKETS and evict the real week from the front.
+                    // Fold the sample into the newest bucket instead —
+                    // still counted, nothing destroyed.
+                    if let Some(b) = self.buckets.last_mut() {
+                        b.add(s);
+                    }
+                } else {
+                    let mut b = MinuteBucket::new(minute);
+                    b.add(s);
+                    self.buckets.insert(idx, b);
+                    created = true;
+                }
+                if jumped && created {
+                    // A forward jump beyond the whole retention window: a
+                    // new era is suspected, not trusted (N6). The sample
+                    // collapses into this one bucket; the cutoff holds off
+                    // until witnesses confirm the era below.
+                    self.pending_era_minute = Some(minute);
+                    self.era_witnesses = 0;
+                } else {
+                    self.witness_era(minute);
+                }
             }
         }
         self.prune(minute);
         created
+    }
+
+    /// Record a sample as evidence about the suspected clock era (N6):
+    /// advancing (or holding) inside it accrues witnesses and confirms it;
+    /// anything else — a correction back, a different jump — clears the
+    /// suspicion. Confirmation is in-memory bookkeeping only: the state is
+    /// not serialized, so a restart simply re-observes the era.
+    fn witness_era(&mut self, minute: u64) {
+        match self.pending_era_minute {
+            Some(pending) if minute >= pending => {
+                self.era_witnesses += 1;
+                if self.era_witnesses >= ERA_CONFIRMATION_PUSHES {
+                    self.pending_era_minute = None;
+                }
+            }
+            _ => {
+                self.pending_era_minute = None;
+                self.era_witnesses = 0;
+            }
+        }
     }
 
     /// Add qualifying dwell seconds to the persisted total. The first call
@@ -200,10 +285,16 @@ impl HistoryStore {
         self.dwell_s = Some(self.dwell_s.unwrap_or(0.0) + secs);
     }
 
-    /// Drop buckets older than the retention window, then enforce the hard cap.
+    /// Drop buckets older than the retention window, then enforce the hard
+    /// cap. The cutoff holds off while a forward clock jump is suspected
+    /// (N6): one glitched reading must not wipe the stored week — once the
+    /// era is corroborated (`witness_era`), the cutoff resumes, so a real
+    /// era ages history out exactly as the retention rule dictates.
     fn prune(&mut self, now_minute: u64) {
-        let cutoff = now_minute.saturating_sub(RETENTION_MINUTES);
-        self.buckets.retain(|b| b.minute >= cutoff);
+        if self.pending_era_minute.is_none() {
+            let cutoff = now_minute.saturating_sub(RETENTION_MINUTES);
+            self.buckets.retain(|b| b.minute >= cutoff);
+        }
         if self.buckets.len() > MAX_BUCKETS {
             let extra = self.buckets.len() - MAX_BUCKETS;
             self.buckets.drain(..extra);
@@ -336,7 +427,14 @@ impl HistoryStore {
         }
         p.skip_ws();
         p.expect(b'}')?;
-        Ok(HistoryStore { buckets, dwell_s })
+        Ok(HistoryStore {
+            buckets,
+            dwell_s,
+            // Clock-era suspicion is transient (N6): a freshly loaded store
+            // simply re-observes whatever era the clock is in.
+            pending_era_minute: None,
+            era_witnesses: 0,
+        })
     }
 
     /// Load from disk. A missing file yields an empty store; a file that
@@ -719,6 +817,86 @@ mod tests {
         store.push(&sample(50.0, Some(30.0)), 0);
         assert_eq!(store.buckets.len(), MAX_BUCKETS);
         assert_eq!(store.buckets[0].minute, 500);
+    }
+
+    #[test]
+    fn a_revisited_minute_folds_into_its_existing_bucket() {
+        // N6: a clock stepping back over minutes it already recorded must
+        // reuse those buckets, never mint duplicates that overflow the cap.
+        let mut store = HistoryStore::default();
+        store.push(&sample(50.0, Some(30.0)), 100 * 60);
+        store.push(&sample(50.0, Some(30.0)), 120 * 60);
+        store.push(&sample(60.0, Some(31.0)), 100 * 60); // stepped back onto minute 100
+        assert_eq!(store.buckets.len(), 2);
+        assert_eq!(store.buckets[0].minute, 100);
+        assert_eq!(store.buckets[0].n, 2);
+        assert_eq!(store.buckets[0].soc_n, 2);
+    }
+
+    #[test]
+    fn a_small_backward_correction_keeps_its_sorted_bucket() {
+        // N6: within the lookback window a backward step is a plausible
+        // correction (NTP, manual fix-up) — the bucket inserts sorted
+        // and stays.
+        let mut store = HistoryStore::default();
+        store.push(&sample(50.0, Some(30.0)), 200 * 60);
+        store.push(&sample(50.0, Some(30.0)), 170 * 60); // 30 min back
+        assert_eq!(store.buckets.len(), 2);
+        assert_eq!(store.buckets[0].minute, 170);
+        assert_eq!(store.buckets[1].minute, 200);
+    }
+
+    #[test]
+    fn a_wedged_clock_never_evicts_real_history() {
+        // N6: a clock stuck a year back would otherwise mint one
+        // out-of-order bucket per minute, overflow MAX_BUCKETS, and evict
+        // the real week from the front. Such samples fold into the newest
+        // bucket instead: still counted, nothing destroyed.
+        let mut store = HistoryStore::default();
+        for m in 0..120 {
+            store.push(&sample(50.0, Some(30.0)), (10_000 + m) * 60);
+        }
+        let real_history: Vec<u64> = store.buckets.iter().map(|b| b.minute).collect();
+        // The clock wedges roughly a year in the past and keeps ticking.
+        for m in 0..200 {
+            store.push(&sample(50.0, Some(30.0)), m * 60);
+        }
+        let minutes_now: Vec<u64> = store.buckets.iter().map(|b| b.minute).collect();
+        assert_eq!(minutes_now, real_history, "real history intact");
+        // The stale samples were still counted — in the newest bucket.
+        assert_eq!(store.buckets.last().unwrap().n, 201);
+    }
+
+    #[test]
+    fn a_forward_jump_beyond_retention_does_not_wipe_history() {
+        // N6: one glitched reading a month ahead must not fire the
+        // retention cutoff — the recorded week survives until the new
+        // era is corroborated by normally-advancing samples.
+        let mut store = HistoryStore::default();
+        for m in 0..120 {
+            store.push(&sample(50.0, Some(30.0)), (10_000 + m) * 60);
+        }
+        let before = store.buckets.len();
+        // Jump 30 days ahead: collapses to one bucket, nothing pruned.
+        let jump_minute = 10_120 + 30 * 24 * 60;
+        store.push(&sample(50.0, Some(30.0)), jump_minute * 60);
+        assert_eq!(store.buckets.len(), before + 1);
+        assert_eq!(store.buckets.first().unwrap().minute, 10_000);
+
+        // A correction back to the real clock clears the suspicion at
+        // once: retention is trusted again, and the (still-recent) real
+        // history all sits inside the window — nothing was lost.
+        store.push(&sample(50.0, Some(30.0)), 10_121 * 60);
+        assert_eq!(store.buckets.len(), before + 1);
+        assert_eq!(store.buckets.first().unwrap().minute, 10_000);
+
+        // But a real era — two advancing samples — confirms it, and the
+        // pre-jump buckets then age out exactly as the retention rule
+        // dictates, not one bucket sooner.
+        store.push(&sample(50.0, Some(30.0)), (jump_minute + 1) * 60);
+        store.push(&sample(50.0, Some(30.0)), (jump_minute + 2) * 60);
+        assert_eq!(store.buckets.last().unwrap().minute, jump_minute + 2);
+        assert!(store.buckets.first().unwrap().minute > 10_000 + 119);
     }
 
     #[test]

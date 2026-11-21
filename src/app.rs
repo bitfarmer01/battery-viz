@@ -111,6 +111,10 @@ pub struct App {
     /// Monotonic time of the last dwell-accumulated sample (audit H4);
     /// `None` until the first sample — a first-ever sample credits nothing.
     dwell_prev_s: Option<f64>,
+    /// Unix time of the last sample folded into the daily record (re-audit
+    /// N5); `None` until the first sample. Wall clock, not monotonic: the
+    /// sleep hours N5 accounts for do not tick a monotonic clock everywhere.
+    record_prev_unix: Option<u64>,
     pub last_error: Option<String>,
     /// Most recent platform-notification delivery failure (osascript /
     /// PowerShell / AUMID registration / tray build), shown in the header so
@@ -419,6 +423,7 @@ impl App {
             first_run_note: None,
             buckets_since_save: 0,
             dwell_prev_s: None,
+            record_prev_unix: None,
             last_error: None,
             last_notify_error: None,
             frames_rendered: 0,
@@ -932,10 +937,16 @@ impl App {
 
     /// Fold a sample into the long-term daily record (FR-7): one summary
     /// row per local day — capacity, cycles, hours at high charge, warm
-    /// hours — kept well past the 7-day 1-minute history window.
+    /// hours — kept well past the 7-day 1-minute history window. Re-audit
+    /// N5: the hours come from WALL-CLOCK deltas between consecutive
+    /// samples, not sample counts — a sleeping machine produces no samples,
+    /// yet a night on the charger is real high-charge time.
     fn record_daily(&mut self, sample: &crate::collect::BatterySample) {
+        let now_unix = crate::history::unix_now();
+        let elapsed = crate::record::interval_seconds(self.record_prev_unix, now_unix);
+        self.record_prev_unix = Some(now_unix);
         let day = clock::local_now().day;
-        self.daily_record.fold(sample, day);
+        self.daily_record.fold_timed(sample, day, elapsed);
     }
 
     /// Count new buckets and checkpoint on the cadence boundary.
@@ -985,12 +996,18 @@ impl App {
         Ok(path)
     }
 
-    /// Wake interval for eframe. Visible: paint continuously for smooth
-    /// animations. Hidden (menu-bar agent): the sample tick at 1 Hz is the
-    /// only wake — no GPU frame, no egui draw, engine still advances.
+    /// Wake interval for eframe. Both modes wake at the DATA cadence
+    /// (re-audit N9): the pipelines sample once a second, and the slowest
+    /// collector (macOS ioreg) every 5 s, so painting faster than a second
+    /// only burned GPU/CPU rebuilding four 10,080-point series and two
+    /// plots per frame against unchanged data — 60 fps against 1 Hz data
+    /// was ~98% wasted frames. User interaction still paints immediately:
+    /// egui repaints on input events regardless of this schedule. Hidden
+    /// (menu-bar agent): the sample tick at 1 Hz is the only wake — no GPU
+    /// frame, no egui draw, engine still advances.
     pub fn repaint_interval(&self) -> Duration {
         if self.window_visible {
-            Duration::from_millis(16)
+            crate::collect::SAMPLE_INTERVAL
         } else {
             Duration::from_secs(1)
         }
@@ -1901,5 +1918,17 @@ mod tests {
             "the next day it fires again"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repaint_wakes_at_the_data_cadence_not_60_fps() {
+        // Re-audit N9: a visible window repaints at the sample cadence —
+        // 60 fps against 1 Hz data was ~98% wasted frames; the hidden
+        // menu-bar agent keeps its 1 Hz no-GPU wake.
+        let mut app = app_at(None);
+        app.window_visible = true;
+        assert_eq!(app.repaint_interval(), crate::collect::SAMPLE_INTERVAL);
+        app.window_visible = false;
+        assert_eq!(app.repaint_interval(), Duration::from_secs(1));
     }
 }
