@@ -26,6 +26,15 @@ pub const CAP_SUSTAIN_SECS: u64 = 3 * 60 * 60;
 /// purposes (reported 100%s can wobble slightly).
 pub const NEAR_FULL_SOC: f64 = 99.5;
 
+/// A restored stretch whose last observed sample is older than this is
+/// dropped: the machine was unplugged (or asleep) for too long for the hold
+/// to have been continuous.
+pub const STRETCH_GAP_BREAK_SECS: u64 = 30 * 60;
+
+/// The detection stretch is checkpointed to disk at most once per this many
+/// seconds per stretch, bounding both write rate and restart staleness.
+pub const STRETCH_PERSIST_SECS: u64 = 15 * 60;
+
 /// Where the one-time prompt record lives, given the history path: a sibling
 /// of `history.json` in `<data dir>/battery-viz/`.
 pub fn prompt_path_for(history_path: &Path) -> PathBuf {
@@ -52,7 +61,9 @@ pub enum CapStatus {
     Uncapped,
 }
 
-/// Folds samples into a cap verdict. No I/O; the clock is injected.
+/// Folds samples into a cap verdict. No I/O; the clock is injected. The
+/// running stretch survives a restart via [`CapMonitor::restore_stretch`] —
+/// persistence is the app's job ([`STRETCH_PERSIST_SECS`] cadence).
 #[derive(Debug)]
 pub struct CapMonitor {
     status: CapStatus,
@@ -60,6 +71,9 @@ pub struct CapMonitor {
     plugged_since: Option<u64>,
     /// Highest state of charge seen during the current stretch.
     stretch_max_soc: Option<f64>,
+    /// Unix second of the most recent plugged-in sample of the stretch —
+    /// what a restored stretch is validated against.
+    stretch_last_seen: Option<u64>,
 }
 
 impl CapMonitor {
@@ -79,6 +93,7 @@ impl CapMonitor {
             status,
             plugged_since: None,
             stretch_max_soc: None,
+            stretch_last_seen: None,
         }
     }
 
@@ -104,17 +119,25 @@ impl CapMonitor {
             // Unplugged: any open stretch is broken, nothing carries over.
             self.plugged_since = None;
             self.stretch_max_soc = None;
+            self.stretch_last_seen = None;
             return;
         }
         let since = *self.plugged_since.get_or_insert(now_s);
+        self.stretch_last_seen = Some(self.stretch_last_seen.map_or(now_s, |l| l.max(now_s)));
         let soc = sample.state_of_charge;
 
         // Reaching full on AC is positive evidence there is no cap: a capped
-        // pack is held below full by firmware. `Full` without a state of
-        // charge also counts — both collectors only report `Full` when the
-        // pack really is full.
-        if state == ChargingState::Full || soc.is_some_and(|s| s >= NEAR_FULL_SOC) {
+        // pack is held below full by firmware. The `Full` charging state
+        // alone is NOT enough — it can be derived from a firmware
+        // "charge complete" signal that also fires on a capped pack — so a
+        // near-full state of charge must corroborate it. A `Full` without a
+        // corroborating reading is inconclusive and only folds into the
+        // stretch like any other plugged sample.
+        if soc.is_some_and(|s| s >= NEAR_FULL_SOC) {
             self.status = CapStatus::Uncapped;
+            self.plugged_since = None;
+            self.stretch_max_soc = None;
+            self.stretch_last_seen = None;
             return;
         }
 
@@ -131,7 +154,46 @@ impl CapMonitor {
         let stretched = now_s.saturating_sub(since) >= CAP_SUSTAIN_SECS;
         if now_holding && held_below_full && stretched {
             self.status = CapStatus::Capped;
+            self.plugged_since = None;
+            self.stretch_max_soc = None;
+            self.stretch_last_seen = None;
         }
+    }
+
+    /// The open stretch, for persistence: `(started, last_seen, max SoC)`.
+    /// `None` when no stretch is open (verdict resolved, feature hidden, or
+    /// the machine is unplugged).
+    pub fn stretch_state(&self) -> Option<(u64, u64, Option<f64>)> {
+        match (self.plugged_since, self.stretch_last_seen) {
+            (Some(started), Some(last_seen)) => Some((started, last_seen, self.stretch_max_soc)),
+            _ => None,
+        }
+    }
+
+    /// Resume a stretch restored from disk. Only meaningful while detection
+    /// is still running; a stretch whose last observed sample is older than
+    /// [`STRETCH_GAP_BREAK_SECS`] is discarded (the hold was not continuous),
+    /// and a restored max at or above near-full is itself positive no-cap
+    /// evidence — it is a corroborated state of charge reading.
+    pub fn restore_stretch(&mut self, stretch: StretchState, now_s: u64) {
+        if !matches!(self.status, CapStatus::Undetermined) {
+            return;
+        }
+        let StretchState {
+            started,
+            last_seen,
+            max_soc,
+        } = stretch;
+        if last_seen < started || now_s.saturating_sub(last_seen) > STRETCH_GAP_BREAK_SECS {
+            return;
+        }
+        if max_soc.is_some_and(|m| m >= NEAR_FULL_SOC) {
+            self.status = CapStatus::Uncapped;
+            return;
+        }
+        self.plugged_since = Some(started);
+        self.stretch_max_soc = max_soc;
+        self.stretch_last_seen = Some(last_seen);
     }
 }
 
@@ -161,11 +223,23 @@ impl CapPromptAnswer {
     }
 }
 
-/// One-time prompt bookkeeping. Once answered, never reset — the prompt is
-/// shown at most once per machine (spec FR-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One-time prompt bookkeeping plus the persisted detection stretch. Once
+/// answered, never reset — the prompt is shown at most once per machine
+/// (spec FR-1). The stretch rides in the same file so a restart resumes a
+/// running detection instead of resetting it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PromptRecord {
     pub answered: Option<CapPromptAnswer>,
+    pub stretch: Option<StretchState>,
+}
+
+/// A plugged-in hold in progress: unix seconds it began and was last seen,
+/// plus the highest state of charge observed in it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StretchState {
+    pub started: u64,
+    pub last_seen: u64,
+    pub max_soc: Option<f64>,
 }
 
 /// Should the one-time setup prompt be on screen right now? Only positive
@@ -175,28 +249,117 @@ pub fn should_prompt(status: CapStatus, record: PromptRecord) -> bool {
     matches!(status, CapStatus::Uncapped) && record.answered.is_none()
 }
 
-/// Load the persisted record. A missing or unreadable file means unanswered:
-/// a two-line record cannot be made corrupt enough to matter, and the worst
-/// case is one more showing — it is the answer, not the showing, that must
-/// never repeat.
-pub fn load_record(path: Option<&Path>) -> PromptRecord {
+const RECORD_MAGIC: &str = "battery-viz-cap-setup-1";
+
+/// Load the persisted record. A missing file means unanswered. A file that
+/// exists but cannot be parsed is corruption, not absence: it is quarantined
+/// to `<name>.corrupt` (the PR #7 discipline — never overwritten in place)
+/// and a notice is returned so the app can surface it. A file that cannot be
+/// read at all is surfaced without quarantine — its bytes cannot be
+/// preserved — and reads as unanswered.
+pub fn load_record(path: Option<&Path>) -> (PromptRecord, Option<String>) {
     let Some(path) = path else {
-        return PromptRecord::default();
+        return (PromptRecord::default(), None);
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return PromptRecord::default();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // No file: first run. Anything else (permissions, …) is surfaced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (PromptRecord::default(), None);
+        }
+        Err(e) => {
+            return (
+                PromptRecord::default(),
+                Some(format!(
+                    "charge-cap state could not be read ({}); treated as unanswered: {e}",
+                    path.display()
+                )),
+            )
+        }
     };
-    let answered = text.lines().nth(1).and_then(CapPromptAnswer::from_token);
-    PromptRecord { answered }
+    match parse_record(&text) {
+        Ok(record) => (record, None),
+        Err(message) => {
+            let err = crate::history::quarantine(
+                path,
+                format!(
+                    "charge-cap state file could not be read and was preserved as a .corrupt sibling; treated as unanswered: {message}"
+                ),
+            );
+            (PromptRecord::default(), Some(err.message))
+        }
+    }
 }
 
-/// Persist an answered record atomically (temp sibling + fsync + rename, the
-/// history store's pattern), so a crash mid-write cannot half-answer.
-/// Unanswered records are never written.
-pub fn save_record(path: &Path, record: PromptRecord) -> Result<(), String> {
-    let Some(answer) = record.answered else {
-        return Ok(());
+/// Parse the record text. Format (line-based, the history store's minimal
+/// style):
+///
+/// ```text
+/// battery-viz-cap-setup-1
+/// <answered|dismissed|empty>
+/// stretch <started> <last_seen> <max_soc|->
+/// ```
+fn parse_record(text: &str) -> Result<PromptRecord, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.first() != Some(&RECORD_MAGIC) {
+        return Err(format!(
+            "unrecognized format, wanted magic {RECORD_MAGIC:?}"
+        ));
+    }
+    if lines.len() > 3 {
+        return Err("too many lines".into());
+    }
+    let answered = match lines.get(1).map(|l| l.trim()) {
+        None | Some("") => None,
+        Some(token) => Some(
+            CapPromptAnswer::from_token(token)
+                .ok_or_else(|| format!("unknown answer token {token:?}"))?,
+        ),
     };
+    let stretch = match lines.get(2).copied().map(str::trim) {
+        None | Some("") => None,
+        Some(line) => {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 4 || parts[0] != "stretch" {
+                return Err(format!("malformed stretch line {line:?}"));
+            }
+            let started = parts[1]
+                .parse::<u64>()
+                .map_err(|e| format!("stretch start: {e}"))?;
+            let last_seen = parts[2]
+                .parse::<u64>()
+                .map_err(|e| format!("stretch last-seen: {e}"))?;
+            let max_soc = match parts[3] {
+                "-" => None,
+                value => Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|e| format!("stretch max SoC: {e}"))?,
+                ),
+            };
+            Some(StretchState {
+                started,
+                last_seen,
+                max_soc,
+            })
+        }
+    };
+    Ok(PromptRecord { answered, stretch })
+}
+
+/// Persist the record atomically (temp sibling + fsync + rename, the history
+/// store's pattern), so a crash mid-write cannot half-write it. A fully
+/// empty record removes the file instead — there is nothing to keep.
+pub fn save_record(path: &Path, record: PromptRecord) -> Result<(), String> {
+    if record.answered.is_none() && record.stretch.is_none() {
+        // Nothing worth keeping: an empty record must not shadow a corrupt
+        // quarantine with a fresh blank file.
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("remove {}: {e}", path.display())),
+        }
+    }
     let dir = path
         .parent()
         .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
@@ -205,7 +368,19 @@ pub fn save_record(path: &Path, record: PromptRecord) -> Result<(), String> {
     let write = || -> Result<(), String> {
         let mut f =
             std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-        write!(f, "battery-viz-cap-setup-1\n{}\n", answer.token())
+        let stretch = record.stretch.map_or_else(String::new, |st| {
+            format!(
+                "stretch {} {} {}\n",
+                st.started,
+                st.last_seen,
+                st.max_soc
+                    .map_or_else(|| "-".to_string(), |m| format!("{m}"))
+            )
+        });
+        let answer = record
+            .answered
+            .map_or(String::new(), |a| format!("{}\n", a.token()));
+        write!(f, "{RECORD_MAGIC}\n{answer}{stretch}")
             .and_then(|()| f.sync_all())
             .map_err(|e| format!("write {}: {e}", tmp.display()))
     };

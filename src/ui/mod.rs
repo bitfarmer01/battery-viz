@@ -202,6 +202,12 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 ui.separator();
                 ui.weak(note);
             }
+            // FR-1: the charge-cap state file could not be read — sticky,
+            // never silent.
+            if let Some(err) = &app.cap_setup_load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
+            }
             ui.separator();
             let pause_label = if app.alerts_paused {
                 "▶ Resume alerts"
@@ -457,12 +463,12 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
             ui.add_space(4.0);
             ui.colored_label(
                 egui::Color32::from_rgb(120, 200, 130),
-                "🛡 Charge cap active — the pack is being held below full on AC.",
+                "🛡 Charge cap: likely active (behavioural) — the pack has been held below full on AC for hours.",
             );
         }
         CapStatus::Uncapped => {
             ui.add_space(4.0);
-            ui.weak("Charge cap: none detected.");
+            ui.weak("Charge cap: likely none (behavioural) — the pack reached full on AC.");
         }
     }
 }

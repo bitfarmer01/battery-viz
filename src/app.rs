@@ -120,6 +120,12 @@ pub struct App {
     cap_prompt_record: PromptRecord,
     /// Where the prompt record persists; `None` keeps it in memory only.
     cap_prompt_path: Option<PathBuf>,
+    /// Corrupt or unreadable charge-cap state — sticky notice, surfaced in
+    /// the header (the `history_load_error` convention; never silent).
+    pub cap_setup_load_error: Option<String>,
+    /// The stretch state as last written to disk, so checkpointing can tell
+    /// "unchanged since the last persist" from "time to persist again".
+    cap_stretch_persisted: Option<capdetect::StretchState>,
     /// FR-0 adapter for this machine: detectability, guidance, maker.
     /// Feature code asks it, never the OS directly.
     capabilities: Box<dyn Capabilities>,
@@ -282,13 +288,21 @@ impl App {
             .as_deref()
             .map(read_advice_shown)
             .unwrap_or((false, None));
-        // FR-1: one-time charge-cap setup prompt record, persisted next to
-        // the history store so "at most once ever" survives restarts.
+        // FR-1: one-time charge-cap setup prompt record + detection stretch,
+        // persisted next to the history store so "at most once ever" and a
+        // running detection both survive restarts.
         let cap_prompt_path = history_path.as_ref().map(|p| capdetect::prompt_path_for(p));
-        let cap_prompt_record = capdetect::load_record(cap_prompt_path.as_deref());
+        let (cap_prompt_record, cap_setup_load_error) =
+            capdetect::load_record(cap_prompt_path.as_deref());
         // FR-0 adapter for this machine.
         let capabilities = crate::caps::platform_capabilities();
-        let cap_monitor = CapMonitor::for_adapter(capabilities.as_ref());
+        let mut cap_monitor = CapMonitor::for_adapter(capabilities.as_ref());
+        // Resume a detection stretch from a previous session, so a capped
+        // machine can resolve across restarts instead of starting over.
+        let cap_stretch_persisted = cap_prompt_record.stretch;
+        if let Some(stretch) = cap_prompt_record.stretch {
+            cap_monitor.restore_stretch(stretch, crate::history::unix_now());
+        }
         let mut app = App {
             rx,
             latest: None,
@@ -332,6 +346,8 @@ impl App {
             cap_monitor,
             cap_prompt_record,
             cap_prompt_path,
+            cap_setup_load_error,
+            cap_stretch_persisted,
             capabilities,
             start: std::time::Instant::now(),
         };
@@ -415,6 +431,7 @@ impl App {
             self.dwell_prev_s = Some(now_s);
             self.record_daily(sample);
             self.cap_monitor.observe(sample, crate::history::unix_now());
+            self.checkpoint_cap_stretch();
             self.tick_alerts(sample);
         }
         if let Some(mut sample) = samples.into_iter().last() {
@@ -509,14 +526,68 @@ impl App {
         self.capabilities.guidance(SettingKind::ChargeCap)
     }
 
-    /// FR-1: record the user's answer; the prompt never shows again. A
-    /// failed persist surfaces in the header — never silent — and the next
-    /// launch re-asks rather than silently forgetting the prompt.
+    /// FR-1: record the user's answer; the prompt never shows again. The
+    /// answer is persisted BEFORE it is committed to memory: a failed persist
+    /// leaves the prompt on screen (the error surfaces in the header) rather
+    /// than hiding it for the session and silently re-asking next launch.
     pub fn answer_cap_prompt(&mut self, answer: CapPromptAnswer) {
-        self.cap_prompt_record.answered = Some(answer);
-        if let Some(path) = &self.cap_prompt_path {
-            if let Err(e) = capdetect::save_record(path, self.cap_prompt_record) {
-                self.last_error = Some(e);
+        let mut pending = self.cap_prompt_record;
+        pending.answered = Some(answer);
+        match self.cap_prompt_path.as_deref().map(|p| capdetect::save_record(p, pending)) {
+            Some(Ok(())) | None => self.cap_prompt_record = pending,
+            Some(Err(e)) => {
+                self.last_error = Some(format!(
+                    "charge-cap prompt answer was not saved; the prompt stays up: {e}"
+                ));
+            }
+        }
+    }
+
+    /// FR-1: keep the detection stretch on disk — at most one write per
+    /// [`capdetect::STRETCH_PERSIST_SECS`] per stretch, plus one write when a
+    /// stretch breaks — so a restart resumes a running detection instead of
+    /// resetting it and a capped machine can resolve across sessions.
+    /// Failures surface in the header, never silent.
+    fn checkpoint_cap_stretch(&mut self) {
+        let stretch = self
+            .cap_monitor
+            .stretch_state()
+            .map(|(started, last_seen, max_soc)| capdetect::StretchState {
+                started,
+                last_seen,
+                max_soc,
+            });
+        match (stretch, self.cap_stretch_persisted) {
+            (Some(s), last) => {
+                let due = last.map_or(true, |prev| {
+                    s.last_seen.saturating_sub(prev.last_seen) >= capdetect::STRETCH_PERSIST_SECS
+                });
+                if due && self.persist_cap_record(Some(s)) {
+                    self.cap_stretch_persisted = Some(s);
+                }
+            }
+            // The stretch is gone (unplugged, or the verdict resolved); if
+            // disk still carries one, clear it so a restart does not
+            // resurrect a broken stretch.
+            (None, Some(_)) => {
+                if self.persist_cap_record(None) {
+                    self.cap_stretch_persisted = None;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Write the cap-setup record as it currently stands, optionally carrying
+    /// a stretch. Returns whether the write landed.
+    fn persist_cap_record(&mut self, stretch: Option<capdetect::StretchState>) -> bool {
+        let mut record = self.cap_prompt_record;
+        record.stretch = stretch;
+        match self.cap_prompt_path.as_deref().map(|p| capdetect::save_record(p, record)) {
+            Some(Ok(())) | None => true,
+            Some(Err(e)) => {
+                self.last_error = Some(format!("charge-cap state could not be saved: {e}"));
+                false
             }
         }
     }
