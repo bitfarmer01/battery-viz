@@ -42,20 +42,35 @@ pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
 /// even under pathological clocks, evicting oldest first.
 pub const MAX_DAYS: usize = 10 * 366;
 
+/// Per-interval sanity cap on credited wall-clock time (re-audit N5). The
+/// dwell convention's 60 s cap exists to keep stale qualification from
+/// backfilling a SCORE factor, but it can never credit a sleep gap — sleep
+/// arrives as ONE multi-hour interval between the last pre-sleep and first
+/// post-wake samples, which is exactly the time N5 says must be counted.
+/// The record's cap is therefore sized to cover an overnight session
+/// (generous) while still bounding a pathological gap (machine off for
+/// days, wedged clock) to a bounded over-credit in the SAFE direction —
+/// under-counting high-charge time, never inventing it.
+const MAX_INTERVAL_S: f64 = 12.0 * 3600.0;
+
 /// On-disk schema version. A mismatch is treated as a corrupt file.
-/// Version 4 keeps version 3's row layout: the bump marks the threshold
-/// era — from v4 on, `high_n` counts samples above the N3 dwell threshold
-/// (band top + hysteresis) rather than at-or-above exactly 80%, so rows
-/// parsed from older versions have their legacy `high_n` retired to zero
-/// once at load, exactly like the live dwell total (review LOW 1 /
-/// MEDIUM 2: last week's hours must not be re-labeled under wording they
-/// were never counted for). Version 3 added per-day unplugged-discharge
-/// tracking (`disch_n`, `disch_min`, `disch_max`) for FR-2's usage-based
-/// cap recommendation (re-audit N1); version 2 rows (9 fields) still
-/// parse with those fields absent, and version 1 rows (7 fields) with
-/// the SoC fields absent too — those days contribute no discharge range
-/// rather than a guessed one. Known versions are matched exactly.
-const SCHEMA_VERSION: f64 = 4.0;
+/// Version 5 adds the wall-clock second accumulators (`high_s`, `warm_s`,
+/// re-audit N5): sample counts assumed 1 Hz, but a sleeping machine
+/// produces no samples, so high-charge/warm time now accrues from the
+/// wall-clock delta between consecutive samples. Migration at load: v4
+/// rows were counted under the SAME threshold at a documented 1 Hz
+/// cadence, so their `high_n`/`warm_n` convert exactly to seconds; v1–v3
+/// rows keep the wave-1a retirements (`high_n` → 0, different threshold
+/// era) and their warm counts also convert exactly (the warm threshold
+/// never changed). Version 4 kept version 3's row layout: the bump marks
+/// the threshold era — from v4 on, `high_n` counts samples above the N3
+/// dwell threshold (band top + hysteresis) rather than at-or-above exactly
+/// 80%. Version 3 added per-day unplugged-discharge tracking (`disch_n`,
+/// `disch_min`, `disch_max`) for FR-2's usage-based cap recommendation;
+/// version 2 rows (9 fields) still parse with those fields absent, and
+/// version 1 rows (7 fields) with the SoC fields absent too. Known
+/// versions are matched exactly.
+const SCHEMA_VERSION: f64 = 5.0;
 
 /// One day's summary. Sums + counts per metric so a partially-populated
 /// day (missing temperature on Windows, say) never poisons the mean.
@@ -72,8 +87,14 @@ pub struct DailyRow {
     /// Samples meaningfully above the high-charge threshold
     /// (`high_charge_threshold()` — the dwell convention).
     pub high_n: u32,
+    /// Wall-clock seconds spent above the high-charge threshold that day
+    /// (re-audit N5). Sample counts assumed 1 Hz, but a sleeping machine
+    /// produces no samples — hours derive from elapsed time, not counts.
+    pub high_s: f64,
     /// Samples at or above `WARM_TEMP_C`.
     pub warm_n: u32,
+    /// Wall-clock seconds at or above `WARM_TEMP_C` that day (re-audit N5).
+    pub warm_s: f64,
     /// Samples that carried a state of charge (FR-2: the quality gate for
     /// the day's minimum — a day with too few readings contributes none).
     pub soc_n: u32,
@@ -108,6 +129,8 @@ impl DailyRow {
             cycles_last: None,
             high_n: 0,
             warm_n: 0,
+            high_s: 0.0,
+            warm_s: 0.0,
             soc_n: 0,
             soc_min: None,
             disch_n: 0,
@@ -128,20 +151,21 @@ impl DailyRow {
         }
     }
 
-    /// Hours at high charge that day. The collector samples at 1 Hz, so a
-    /// count of samples is a count of seconds. Consumed from FR-4 (warm
-    /// hours) and FR-9 (digest) onward; stored now so the record is
-    /// complete from day one.
+    /// Hours at high charge that day, from the accumulated wall-clock
+    /// seconds (`high_s`, re-audit N5) — not a sample count: a sleeping
+    /// machine produces no samples, yet its high-charge hours are real.
+    /// Consumed from FR-4 (warm hours) and FR-9 (digest) onward; stored now
+    /// so the record is complete from day one.
     #[allow(dead_code)]
     pub fn high_hours(&self) -> f64 {
-        self.high_n as f64 / 3600.0
+        self.high_s / 3600.0
     }
 
-    /// Warm hours that day, same 1 Hz conversion. Consumed from FR-4
-    /// (warm hours) and FR-9 (digest) onward.
+    /// Warm hours that day, same wall-clock conversion (`warm_s`).
+    /// Consumed from FR-4 (warm hours) and FR-9 (digest) onward.
     #[allow(dead_code)]
     pub fn warm_hours(&self) -> f64 {
-        self.warm_n as f64 / 3600.0
+        self.warm_s / 3600.0
     }
 }
 
@@ -162,7 +186,31 @@ pub struct RecordLoad {
 impl DailyRecord {
     /// Fold one sample into its day row. Returns true when a new row was
     /// created (a checkpoint trigger, like the history store's).
+    ///
+    /// Counts the sample but credits no wall-clock time — the shape tests
+    /// and callers that have no interval to speak of use. The live sample
+    /// stream calls [`Self::fold_timed`], which is where re-audit N5's
+    /// wall-clock accounting lives.
+    #[allow(dead_code)] // test convenience; the live stream calls fold_timed
     pub fn fold(&mut self, s: &BatterySample, day: u32) -> bool {
+        self.fold_timed(s, day, 0.0)
+    }
+
+    /// Fold one sample, crediting `elapsed_s` — the wall-clock seconds
+    /// since the previous sample (re-audit N5) — to the day's high-charge
+    /// and warm totals when THIS sample, the gap's closing edge, qualifies.
+    /// The closing edge governs: a laptop asleep on the charger overnight
+    /// produces ONE gap whose closing sample is still Full/onAC at high
+    /// charge, so the night lands in the day row where it belongs; a wake
+    /// mid-drain (closing sample unplugged, below threshold) credits
+    /// nothing. Credited time is bounded by [`MAX_INTERVAL_S`] so a
+    /// multi-day outage cannot backfill a week into one row.
+    pub fn fold_timed(&mut self, s: &BatterySample, day: u32, elapsed_s: f64) -> bool {
+        let credit = if elapsed_s.is_finite() {
+            elapsed_s.clamp(0.0, MAX_INTERVAL_S)
+        } else {
+            0.0
+        };
         // One row per day, ever: a clock that revisits an already-recorded
         // day (timezone change, NTP step back then forward) folds into that
         // row — a duplicate would split the day's samples silently and
@@ -211,9 +259,11 @@ impl DailyRecord {
             .is_some_and(|soc| soc >= high_charge_threshold())
         {
             row.high_n += 1;
+            row.high_s += credit;
         }
         if s.temperature_c.is_some_and(|t| t >= WARM_TEMP_C) {
             row.warm_n += 1;
+            row.warm_s += credit;
         }
         self.prune();
         created
@@ -249,19 +299,19 @@ impl DailyRecord {
         added
     }
 
-    /// Serialize to the on-disk JSON schema (v4):
-    /// `{"version":4,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min,disch_n,disch_min,disch_max],...]}`
+    /// Serialize to the on-disk JSON schema (v5):
+    /// `{"version":5,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,high_s,warm_s,soc_n,soc_min,disch_n,disch_min,disch_max],...]}`
     /// (cycles, soc_min and the discharge bounds are NaN when unknown).
     /// Rust's f64 Display round-trips.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(110 * self.rows.len() + 32);
+        let mut out = String::with_capacity(130 * self.rows.len() + 32);
         out.push_str(&format!("{{\"version\":{},\"rows\":[", SCHEMA_VERSION));
         for (i, r) in self.rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
-                "[{},{},{},{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{},{},{}]",
                 r.day,
                 r.n,
                 r.soh_sum,
@@ -269,6 +319,8 @@ impl DailyRecord {
                 r.cycles_last.map(|c| c as f64).unwrap_or(f64::NAN),
                 r.high_n,
                 r.warm_n,
+                r.high_s,
+                r.warm_s,
                 r.soc_n,
                 r.soc_min.unwrap_or(f64::NAN),
                 r.disch_n,
@@ -289,16 +341,18 @@ impl DailyRecord {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        // Known versions only, exactly (review LOW 2): 1, 2, 3 and 4 ever
+        // Known versions only, exactly (review LOW 2): 1 through 5 ever
         // existed; anything else — past or future — is corruption here.
-        if !matches!(version, 1.0 | 2.0 | 3.0 | 4.0) {
+        if !matches!(version, 1.0 | 2.0 | 3.0 | 4.0 | 5.0) {
             return Err(format!("unsupported schema version {version}"));
         }
         // Version 1 rows carry 7 fields (no SoC tracking); version 2, 9;
-        // versions 3 and 4, 12 (adds the unplugged discharge range).
+        // versions 3 and 4, 12 (adds the unplugged discharge range);
+        // version 5, 14 (adds the wall-clock second accumulators, N5).
         let arity = match version {
             1.0 => 7,
             2.0 => 9,
+            5.0 => 14,
             _ => 12,
         };
         // Threshold era (review LOW 1): a row written before v4 counted
@@ -330,7 +384,7 @@ impl DailyRecord {
                 return Err(format!("invalid cycle count {cycles}"));
             }
             let soc_min = if arity >= 9 {
-                let v = f[8];
+                let v = f[if arity == 14 { 10 } else { 8 }];
                 if v.is_nan() {
                     None
                 } else if !(0.0..=100.0).contains(&v) {
@@ -357,6 +411,14 @@ impl DailyRecord {
                     Ok(Some(v))
                 }
             };
+            // Field indices shift at v5: the wall-clock second accumulators
+            // (high_s, warm_s) are inserted after warm_n, moving every later
+            // field two places right (re-audit N5).
+            let (i_soc_n, i_disch_n, i_disch_min, i_disch_max) = if arity == 14 {
+                (9, 11, 12, 13)
+            } else {
+                (7, 9, 10, 11)
+            };
             rows.push(DailyRow {
                 day: f[0] as u32,
                 n: f[1] as u32,
@@ -369,11 +431,28 @@ impl DailyRecord {
                 },
                 high_n: if legacy_era { 0 } else { f[5] as u32 },
                 warm_n: f[6] as u32,
-                soc_n: if arity >= 9 { f[7] as u32 } else { 0 },
+                // N5 wall-clock seconds: v5 rows carry them directly.
+                // Older rows convert their sample counts exactly — the
+                // collectors ran at a documented 1 Hz, and v4 counted under
+                // the same threshold; a pre-v4 high count stays retired
+                // with its count, never re-labeled as hours it never was.
+                high_s: if arity == 14 {
+                    f[7]
+                } else if !legacy_era {
+                    f[5]
+                } else {
+                    0.0
+                },
+                warm_s: if arity == 14 { f[8] } else { f[6] },
+                soc_n: if arity >= 9 { f[i_soc_n] as u32 } else { 0 },
                 soc_min,
-                disch_n: if arity == 12 { f[9] as u32 } else { 0 },
-                disch_min: pct(10)?,
-                disch_max: pct(11)?,
+                disch_n: if disch_tracked {
+                    f[i_disch_n] as u32
+                } else {
+                    0
+                },
+                disch_min: pct(i_disch_min)?,
+                disch_max: pct(i_disch_max)?,
                 disch_tracked,
             });
             p.skip_ws();
@@ -436,6 +515,19 @@ impl DailyRecord {
             let _ = std::fs::remove_file(&tmp);
             format!("atomic rename: {e}")
         })
+    }
+}
+
+/// Wall-clock seconds the record can honestly account between two samples
+/// (re-audit N5): the delta between consecutive samples' unix timestamps.
+/// A first-ever sample (no predecessor) and a backward clock step credit
+/// nothing; a forward gap is credited in full and bounded per interval by
+/// [`MAX_INTERVAL_S`] at fold time. Wall clock, not monotonic: the sleep
+/// hours N5 restores do not tick a monotonic clock on every platform.
+pub fn interval_seconds(prev_unix: Option<u64>, now_unix: u64) -> f64 {
+    match prev_unix {
+        Some(prev) if now_unix > prev => (now_unix - prev) as f64,
+        _ => 0.0,
     }
 }
 
@@ -504,22 +596,24 @@ mod tests {
 
     #[test]
     fn unknown_record_schema_version_is_corrupt() {
-        // Review LOW 2: known versions only, exactly — 1, 2, 3 and 4 ever
-        // existed. Anything else, past or future, is corruption here, not a
-        // best-effort parse of a format nobody wrote.
-        for version in ["5.0", "2.5", "0.9"] {
+        // Review LOW 2: known versions only, exactly — 1, 2, 3, 4 and 5
+        // ever existed. Anything else, past or future, is corruption here,
+        // not a best-effort parse of a format nobody wrote.
+        for version in ["6.0", "2.5", "0.9"] {
             let text = format!("{{\"version\":{version},\"rows\":[[3,2,180.0,2,120,1,0]]}}");
             assert!(
                 DailyRecord::from_json(&text).is_err(),
                 "version {version} must not parse"
             );
         }
-        // All four known versions still load.
-        for version in ["1.0", "2.0", "3.0", "4.0"] {
+        // All five known versions still load.
+        for version in ["1.0", "2.0", "3.0", "4.0", "5.0"] {
             let rows = if version == "1.0" {
                 "[3,2,180.0,2,120,1,0]"
             } else if version == "2.0" {
                 "[3,2,180.0,2,120,1,0,2,45.5]"
+            } else if version == "5.0" {
+                "[3,2,180.0,2,120,1,0,1.0,0.0,2,45.5,1,60.0,80.0]"
             } else {
                 "[3,2,180.0,2,120,1,0,2,45.5,1,60.0,80.0]"
             };
@@ -597,22 +691,117 @@ mod tests {
     }
 
     #[test]
-    fn hours_at_high_charge_and_warm_hours_count_seconds() {
+    fn hours_at_high_charge_and_warm_hours_count_wall_clock_seconds() {
+        // Re-audit N5: hours come from the wall-clock seconds credited by
+        // fold_timed, not from sample counts — a sleeping machine produces
+        // no samples, yet its high-charge time is real.
         let mut rec = DailyRecord::default();
-        // Two high-charge samples (1 s each at 1 Hz), one warm, one neither.
-        rec.fold(&sample(85.0, Some(31.0)), 7);
-        rec.fold(&sample(95.0, Some(45.0)), 7);
-        rec.fold(&sample(50.0, Some(10.0)), 7);
+        // Two high-charge samples 1 s apart, one warm, one neither.
+        rec.fold_timed(&sample(85.0, Some(31.0)), 7, 0.0); // first sample: no interval yet
+        rec.fold_timed(&sample(95.0, Some(45.0)), 7, 1.0);
+        rec.fold_timed(&sample(50.0, Some(10.0)), 7, 1.0); // below both: counts, credits nothing
         let r = rec.rows[0];
         assert_eq!(r.high_n, 2);
         assert_eq!(r.warm_n, 2);
-        assert!((r.high_hours() - 2.0 / 3600.0).abs() < 1e-12);
-        assert!((r.warm_hours() - 2.0 / 3600.0).abs() < 1e-12);
+        assert!((r.high_hours() - 1.0 / 3600.0).abs() < 1e-12);
+        assert!((r.warm_hours() - 1.0 / 3600.0).abs() < 1e-12);
         // Exactly on the thresholds counts as in.
         let mut rec = DailyRecord::default();
-        rec.fold(&sample(high_charge_threshold(), Some(WARM_TEMP_C)), 7);
+        rec.fold_timed(&sample(high_charge_threshold(), Some(WARM_TEMP_C)), 7, 1.0);
         assert_eq!(rec.rows[0].high_n, 1);
         assert_eq!(rec.rows[0].warm_n, 1);
+        assert!((rec.rows[0].high_hours() - 1.0 / 3600.0).abs() < 1e-12);
+    }
+
+    /// Re-audit N5, the headline scenario: a laptop on the charger
+    /// overnight. Sleep produces ONE multi-hour gap — the last pre-sleep
+    /// and first post-wake samples are the only evidence — and the wake
+    /// sample still qualifies (Full, on AC, at 100%), so the night must
+    /// land in the day row as high-charge hours.
+    #[test]
+    fn an_overnight_sleep_gap_is_credited_as_high_charge_time() {
+        let mut rec = DailyRecord::default();
+        // 22:00 sample, then nothing until the 08:00 wake sample.
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, 0.0);
+        rec.fold_timed(&sample(100.0, Some(26.0)), 7, 8.0 * 3600.0);
+        let r = rec.rows[0];
+        assert_eq!(r.high_n, 2);
+        assert!((r.high_hours() - 8.0).abs() < 1e-9, "{}", r.high_hours());
+        // The wake sample is cool: a sleep gap is never credited as warm
+        // time — only the closing edge's temperature speaks.
+        assert_eq!(r.warm_n, 1);
+        assert!((r.warm_hours() - 0.0).abs() < 1e-12);
+    }
+
+    /// Re-audit N5: the gap is attributed by the state at the gap's
+    /// closing edge. Waking unplugged mid-drain credits nothing, however
+    /// the machine was parked when it fell asleep.
+    #[test]
+    fn a_gap_is_credited_by_the_closing_edge_state() {
+        let mut rec = DailyRecord::default();
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, 0.0);
+        // Wake unplugged below the threshold: the night was NOT high-charge
+        // time from this evidence.
+        rec.fold_timed(&unplugged(40.0), 7, 8.0 * 3600.0);
+        assert_eq!(rec.rows[0].high_n, 1);
+        assert!((rec.rows[0].high_hours() - 0.0).abs() < 1e-12);
+
+        // Waking warm (charger fault overnight, say) credits warm time.
+        let mut rec = DailyRecord::default();
+        rec.fold_timed(&sample(60.0, Some(30.0)), 7, 0.0);
+        rec.fold_timed(&sample(60.0, Some(47.0)), 7, 4.0 * 3600.0);
+        assert!((rec.rows[0].warm_hours() - 4.0).abs() < 1e-9);
+        assert!((rec.rows[0].high_hours() - 0.0).abs() < 1e-12);
+    }
+
+    /// A multi-day outage (machine off, wedged clock) must not backfill a
+    /// week into one row: the per-interval sanity cap bounds the credit.
+    #[test]
+    fn a_pathological_gap_is_capped_not_backfilled() {
+        let mut rec = DailyRecord::default();
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, 0.0);
+        // Off for a week, then wake on the charger at 100%: at most
+        // MAX_INTERVAL_S is credited to this one row.
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, 7.0 * 24.0 * 3600.0);
+        assert!(rec.rows[0].high_hours() < 12.5);
+        assert_eq!(rec.rows[0].high_hours(), 12.0);
+        // NaN or negative elapsed credits nothing rather than poisoning.
+        let mut rec = DailyRecord::default();
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, f64::NAN);
+        rec.fold_timed(&sample(100.0, Some(30.0)), 7, -50.0);
+        assert!((rec.rows[0].high_hours() - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn interval_seconds_reads_wall_clock_deltas() {
+        assert_eq!(interval_seconds(None, 1_000), 0.0, "first sample");
+        assert_eq!(interval_seconds(Some(1_000), 3_600), 2_600.0);
+        assert_eq!(interval_seconds(Some(3_600), 1_000), 0.0, "clock back");
+        assert_eq!(interval_seconds(Some(1_000), 1_000), 0.0, "same instant");
+    }
+
+    /// A v4 record upgrades exactly: its high counts were taken under the
+    /// SAME threshold at a documented 1 Hz cadence, so converting them to
+    /// seconds is a unit change, not a re-label; a v3 day keeps its
+    /// retirement (different threshold era) and its warm seconds.
+    #[test]
+    fn v4_high_counts_convert_to_seconds_v3_stay_retired() {
+        // v4 row: day 3, n=2, soh, 2, cycles 120, high_n=600, warm_n=100,
+        // soc fields…
+        let v4 = "{\"version\":4,\"rows\":[[3,2,180.0,2,120,600,100,2,45.5,1,60.0,80.0]]}";
+        let rec = DailyRecord::from_json(v4).expect("v4 parses");
+        assert_eq!(rec.rows[0].high_n, 600);
+        assert_eq!(rec.rows[0].high_s, 600.0);
+        assert_eq!(rec.rows[0].warm_s, 100.0);
+        assert!((rec.rows[0].high_hours() - 600.0 / 3600.0).abs() < 1e-12);
+
+        // v3 row: same threshold era as v1/v2 for high (retired), warm
+        // threshold unchanged so warm counts convert exactly.
+        let v3 = "{\"version\":3,\"rows\":[[3,2,180.0,2,120,600,100,2,45.5,1,60.0,80.0]]}";
+        let rec = DailyRecord::from_json(v3).expect("v3 parses");
+        assert_eq!(rec.rows[0].high_n, 0, "pre-v4 high stock retired");
+        assert_eq!(rec.rows[0].high_s, 0.0);
+        assert_eq!(rec.rows[0].warm_s, 100.0);
     }
 
     #[test]

@@ -31,10 +31,18 @@ pub trait Collector: Send + 'static {
     /// Return one sample. Implementations should be cheap and must not panic
     /// on partial data — missing fields stay `None`.
     fn sample(&mut self) -> CollectorResult;
+    /// How often this collector should be sampled (re-audit N9): the spawn
+    /// cost per sample differs wildly per platform (a subprocess launch on
+    /// macOS vs. a cached WMI query on Windows), so the cadence belongs to
+    /// the collector. The default is the 1 Hz pipeline cadence.
+    fn cadence(&self) -> Duration {
+        SAMPLE_INTERVAL
+    }
 }
 
 /// Spawn `collector` on a background thread; returns the sample receiver.
 pub fn spawn_collector(mut collector: Box<dyn Collector>) -> Receiver<CollectorResult> {
+    let cadence = collector.cadence();
     let (tx, rx) = crossbeam_channel::bounded::<CollectorResult>(CHANNEL_CAPACITY);
     std::thread::Builder::new()
         .name("battery-collector".into())
@@ -43,7 +51,7 @@ pub fn spawn_collector(mut collector: Box<dyn Collector>) -> Receiver<CollectorR
             // Try-send: a full channel means the UI thread is behind; drop
             // this sample rather than back-pressure the collector.
             let _ = tx.try_send(result);
-            std::thread::sleep(SAMPLE_INTERVAL);
+            std::thread::sleep(cadence);
         })
         .expect("spawn battery-collector thread");
     rx

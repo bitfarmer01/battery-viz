@@ -106,6 +106,9 @@ pub fn build_sample(raw: RawWmiBattery) -> Result<BatterySample, String> {
         state_of_charge: raw.estimated_charge_remaining_pct,
         design_capacity: raw.design_capacity_mwh,
         full_charge_capacity: raw.full_charge_capacity_mwh,
+        // N10: the WMI field name is the provenance — the label names it
+        // exactly only when the figure actually came from it.
+        full_charge_capacity_key: raw.full_charge_capacity_mwh.map(|_| "FullChargeCapacity"),
         cycle_limit: None,
         cycle_count: None,
         temperature_c: None,

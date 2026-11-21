@@ -17,6 +17,12 @@ pub struct BatterySample {
     pub design_capacity: Option<f64>,
     /// Full-charge capacity as reported by firmware.
     pub full_charge_capacity: Option<f64>,
+    /// The firmware key the full-charge figure came from (re-audit N10),
+    /// so the scorecard can label the figure EXACTLY — e.g. macOS
+    /// `AppleRawMaxCapacity` (the pack's current full-charge capacity) vs
+    /// `NominalChargeCapacity` (a firmware-nominal figure that reads higher
+    /// on aged packs). `None` when the collector does not track the key.
+    pub full_charge_capacity_key: Option<&'static str>,
     /// OEM-rated cycle limit, when known.
     pub cycle_limit: Option<u32>,
     pub cycle_count: Option<u32>,
@@ -48,6 +54,7 @@ impl Default for BatterySample {
             state_of_charge: None,
             design_capacity: None,
             full_charge_capacity: None,
+            full_charge_capacity_key: None,
             cycle_limit: None,
             cycle_count: None,
             temperature_c: None,

@@ -51,16 +51,23 @@ fn clamp100(v: f64) -> f64 {
 
 /// Where the scored capacity figures come from, shown in the scorecard so
 /// the figure the app scores is never confused with the OS's own smoothed
-/// one (macOS: 85.1% raw gauge vs 90% in Settings on the reference
-/// machine). Provenance rides on the sample's source, so this stays a
-/// data-mapping — no platform-specific logic here.
-fn capacity_source_note(source: SourceKind) -> &'static str {
-    match source {
-        SourceKind::MacIoreg => "raw firmware gauge (ioreg); the macOS Settings figure can differ",
-        SourceKind::MacSystemProfiler => "firmware figures via system_profiler",
-        SourceKind::WindowsWmi => "firmware figures via WMI (Win32_Battery)",
-        SourceKind::WindowsPowerStatus => "Windows power-status figures",
-        SourceKind::Simulator => "simulated figures",
+/// one. Re-audit N10: on macOS the label names the EXACT firmware key the
+/// figure came from — `AppleRawMaxCapacity` (the pack's current full-charge
+/// capacity, the true gauge), never a nominal figure masquerading as it.
+/// Provenance rides on the sample, so this stays a data-mapping — no
+/// platform-specific logic here.
+fn capacity_source_note(s: &BatterySample) -> String {
+    match s.source {
+        SourceKind::MacIoreg => match s.full_charge_capacity_key {
+            Some(key) => format!(
+                "{key} via ioreg (current full-charge capacity); the macOS Settings figure can differ"
+            ),
+            None => "capacity via ioreg; the macOS Settings figure can differ".to_string(),
+        },
+        SourceKind::MacSystemProfiler => "firmware figures via system_profiler".to_string(),
+        SourceKind::WindowsWmi => "firmware figures via WMI (Win32_Battery)".to_string(),
+        SourceKind::WindowsPowerStatus => "Windows power-status figures".to_string(),
+        SourceKind::Simulator => "simulated figures".to_string(),
     }
 }
 
@@ -74,7 +81,7 @@ fn score_soh(s: &BatterySample) -> Option<ParameterScore> {
         weight: weights::SOH,
         detail: format!(
             "Full-charge capacity is {soh:.1}% of design — {}",
-            capacity_source_note(s.source)
+            capacity_source_note(s)
         ),
     })
 }
@@ -383,10 +390,26 @@ mod tests {
     fn soh_detail_names_the_capacity_source() {
         let mut s = full_sample();
         s.source = SourceKind::MacIoreg;
+        // Re-audit N10: the label names the EXACT firmware key the figure
+        // came from, never a nominal figure labelled as the raw gauge.
+        s.full_charge_capacity_key = Some("AppleRawMaxCapacity");
         let detail = score_soh(&s).unwrap().detail;
         assert!(
-            detail.contains("raw firmware gauge (ioreg)") && detail.contains("Settings"),
-            "macOS label distinguishes the raw gauge from the Settings figure: {detail}"
+            detail.contains("AppleRawMaxCapacity via ioreg") && detail.contains("Settings"),
+            "macOS label names the exact capacity key: {detail}"
+        );
+        s.full_charge_capacity_key = Some("NominalChargeCapacity");
+        assert!(
+            score_soh(&s)
+                .unwrap()
+                .detail
+                .contains("NominalChargeCapacity via ioreg"),
+            "fallback key is labelled by its own name"
+        );
+        s.full_charge_capacity_key = None;
+        assert!(
+            score_soh(&s).unwrap().detail.contains("capacity via ioreg"),
+            "unknown key never masquerades as a named one"
         );
         s.source = SourceKind::WindowsWmi;
         assert!(score_soh(&s).unwrap().detail.contains("WMI"));
