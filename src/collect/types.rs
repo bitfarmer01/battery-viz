@@ -40,7 +40,10 @@ pub struct BatterySample {
     /// history store, and stamps the running total onto the latest sample
     /// before the benchmark evaluates it.
     pub high_soc_dwell_s: Option<f64>,
-    /// Capacity design voltage, millivolts (Windows WMI DesignVoltage).
+    // Allowlist (M3 lint gate): populated by the macOS and Windows
+    // collectors, but no component reads it yet — it is carried so the
+    // benchmark can use design voltage without a collector change.
+    #[allow(dead_code)]
     pub design_voltage_mv: Option<f64>,
     /// Warnings surfaced by the OS about the battery.
     pub condition_flags: Vec<ConditionFlag>,
@@ -102,6 +105,10 @@ pub enum ChargingState {
     Unknown,
 }
 
+// Allowlist (M3 lint gate): variants are constructed only by the
+// platform collectors (macOS condition, Windows threshold) — none of
+// which build on every host.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionFlag {
     /// macOS "Condition: Replace Soon" / Windows capacity below threshold.
@@ -110,17 +117,24 @@ pub enum ConditionFlag {
     Failure,
 }
 
-/// State of health: full-charge over design capacity, percent.
+/// State of health: full-charge over design capacity, percent. Either
+/// figure at or below zero is "no data", not a zero health reading (a 0
+/// full-charge figure would otherwise render as a 0% health figure).
 pub fn state_of_health_pct(s: &BatterySample) -> Option<f64> {
     let design = s.design_capacity?;
     if design <= 0.0 {
         return None;
     }
     let fcc = s.full_charge_capacity?;
+    if fcc <= 0.0 {
+        return None;
+    }
     Some(100.0 * fcc / design)
 }
 
-/// Depth of discharge implied by the current state of charge.
+// Allowlist (M3 lint gate): the complement of state_of_health_pct,
+// reserved for the presentation layer's DoD factor (not yet read).
+#[allow(dead_code)]
 pub fn depth_of_discharge_pct(s: &BatterySample) -> Option<f64> {
     s.state_of_charge.map(|soc| 100.0 - soc)
 }

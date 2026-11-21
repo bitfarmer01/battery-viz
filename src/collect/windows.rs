@@ -88,6 +88,19 @@ pub fn decode_battery_status(status: u32) -> ChargingState {
     }
 }
 
+/// Win32_Battery reports an unavailable figure as 0 (DesignCapacity,
+/// FullChargeCapacity, DesignVoltage — Microsoft Learn class docs). On
+/// real hardware the capacity fields are *normally* 0 (re-audit N11d);
+/// left as-is a 0 would flow into the SoH figure as a wrong 0% or 0/0.
+/// Fold it to `None` — "no data", the same shape as a missing field — so
+/// the app degrades to the no-data reading instead of a wrong health
+/// number. Charge remaining (0% is a real reading) and the enumerated
+/// BatteryStatus are NOT normalized.
+#[allow(dead_code)] // reached only by the cfg(windows) live path off-tests
+fn known_capacity(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| *v > 0.0)
+}
+
 /// Build a sample from raw WMI fields. Errors only when no battery data at
 /// all is present; missing individual fields stay `None` ("unknown", not
 /// "healthy").
@@ -100,23 +113,33 @@ pub fn build_sample(raw: RawWmiBattery) -> Result<BatterySample, String> {
         return Err("no battery reported by WMI".into());
     }
 
+    // N11d: prefer a better source when the FR-0 adapter has one — it does
+    // not: its `powercfg /batteryreport` data is a one-time first-run seed,
+    // not a live source, and the real upgrade path (BatteryStaticData
+    // IOCTL) is the planned collector change behind the same interface. So
+    // the degradation is: capacity figures the firmware does not report
+    // render as "no data", never as a wrong health figure.
+    let design = known_capacity(raw.design_capacity_mwh);
+    let full = known_capacity(raw.full_charge_capacity_mwh);
+    let voltage = known_capacity(raw.design_voltage_mv);
+
     Ok(BatterySample {
         collected_at: std::time::SystemTime::now(),
         source: SourceKind::WindowsWmi,
         state_of_charge: raw.estimated_charge_remaining_pct,
-        design_capacity: raw.design_capacity_mwh,
-        full_charge_capacity: raw.full_charge_capacity_mwh,
+        design_capacity: design,
+        full_charge_capacity: full,
         // N10: the WMI field name is the provenance — the label names it
         // exactly only when the figure actually came from it.
-        full_charge_capacity_key: raw.full_charge_capacity_mwh.map(|_| "FullChargeCapacity"),
+        full_charge_capacity_key: full.map(|_| "FullChargeCapacity"),
         cycle_limit: None,
         cycle_count: None,
         temperature_c: None,
-        voltage_mv: raw.design_voltage_mv,
+        voltage_mv: voltage,
         power_w: None,
         charging_state: raw.battery_status.map(decode_battery_status),
         high_soc_dwell_s: None,
-        design_voltage_mv: raw.design_voltage_mv,
+        design_voltage_mv: voltage,
         condition_flags: Vec::new(),
     })
 }
@@ -265,5 +288,49 @@ mod tests {
         };
         let s = build_sample(raw).expect("parse");
         assert_eq!(s.charging_state, None);
+    }
+
+    #[test]
+    fn zero_capacity_fields_degrade_to_no_data_not_a_wrong_health_figure() {
+        // N11d: real firmware normally reports the capacity fields as 0.
+        // The sample must survive (charge % and charging state are real)
+        // while the capacities fold to no-data — SoH is absent, never 0%.
+        let raw = RawWmiBattery {
+            design_capacity_mwh: Some(0.0),
+            full_charge_capacity_mwh: Some(0.0),
+            design_voltage_mv: Some(0.0),
+            estimated_charge_remaining_pct: Some(65.0),
+            battery_status: Some(2),
+        };
+        let s = build_sample(raw).expect("battery data is present");
+        assert_eq!(s.design_capacity, None, "0 design capacity is not data");
+        assert_eq!(s.full_charge_capacity, None);
+        assert_eq!(
+            s.full_charge_capacity_key, None,
+            "no provenance without a figure"
+        );
+        assert_eq!(s.voltage_mv, None);
+        assert_eq!(s.design_voltage_mv, None);
+        assert_eq!(
+            s.state_of_charge,
+            Some(65.0),
+            "charge % is kept — 0% there would be a real reading"
+        );
+        assert_eq!(s.charging_state, Some(ChargingState::OnAcNotCharging));
+        assert!(crate::collect::types::state_of_health_pct(&s).is_none());
+    }
+
+    #[test]
+    fn zero_full_charge_capacity_is_no_data_even_with_a_real_design() {
+        // Defense in depth at the SoH helper: a 0 full-charge figure must
+        // not render as a 0% health figure.
+        let s = build_sample(RawWmiBattery {
+            design_capacity_mwh: Some(60_000.0),
+            full_charge_capacity_mwh: Some(0.0),
+            estimated_charge_remaining_pct: Some(65.0),
+            ..Default::default()
+        })
+        .expect("battery data is present");
+        assert!(crate::collect::types::state_of_health_pct(&s).is_none());
     }
 }

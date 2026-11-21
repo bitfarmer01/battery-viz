@@ -76,6 +76,14 @@ impl eframe::App for Dashboard {
         #[cfg(target_os = "macos")]
         self.handle_tray_commands(ctx);
 
+        // Re-audit Low 5: the header pause button and the tray checkbox are
+        // two controls over one state (`app.alerts_paused`); the checkbox
+        // re-asserts that state every frame so the two can never disagree.
+        #[cfg(target_os = "macos")]
+        if let Some(tray) = &self.tray {
+            tray.sync_pause_checked(self.app.alerts_paused);
+        }
+
         // Finish-card Quit: end the process through eframe's normal teardown
         // (on macOS the close-to-tray intercept yields because
         // `quit_requested` is set first).
@@ -169,9 +177,16 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
             } else {
                 ui.weak("Waiting for first sample…");
             }
-            if let Some(err) = &app.last_error {
+            // Re-audit Low 3: dismissible — a stale error need not stick
+            // until restart, and the next successful sample clears it too.
+            if app.last_error.is_some() {
                 ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(230, 120, 90), format!("⚠ {err}"));
+                if let Some(err) = &app.last_error {
+                    ui.colored_label(egui::Color32::from_rgb(230, 120, 90), format!("⚠ {err}"));
+                }
+                if ui.small_button("Dismiss").clicked() {
+                    app.dismiss_error();
+                }
             }
             if let Some(err) = &app.last_notify_error {
                 ui.separator();
@@ -697,7 +712,13 @@ fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>)
     });
 
     ui.horizontal(|ui| {
-        if ui.button("Export CSV").clicked() {
+        // Re-audit Low 4: once uninstall has run, exporting would silently
+        // recreate files the person just deleted — the action is disabled,
+        // with the reason on screen rather than a dead button.
+        if app.exports_disabled() {
+            ui.add_enabled(false, egui::Button::new("Export CSV"));
+            ui.weak(egui::RichText::new("uninstalled — data exports are disabled").small());
+        } else if ui.button("Export CSV").clicked() {
             *export_status = Some(match app.export_csv() {
                 Ok(path) => format!("Exported to {}", path.display()),
                 Err(e) => format!("Export failed: {e}"),
@@ -831,6 +852,9 @@ fn draw_full_charge_advice(ctx: &egui::Context, app: &mut App) {
     let Some(advice) = app.full_charge_advice.clone() else {
         return;
     };
+    // Re-audit Low 1: the card is actually painted this frame — earn the
+    // once-ever flag here, not at raise (a hidden window renders no frames).
+    app.note_full_charge_advice_rendered();
     egui::TopBottomPanel::top("full_charge_advice_card").show(ctx, |ui| {
         // Top-down primitives only, dismiss button last: a horizontal row
         // mid-panel gets its height from the frame-1 panel-size hint and
