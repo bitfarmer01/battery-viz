@@ -128,8 +128,10 @@ impl WarmHoursReport {
 }
 
 /// Hours rendered as whole hours above one ("3 h") or one decimal below
-/// ("0.5 h") — a digest line, not a gauge.
-fn format_hours(h: f64) -> String {
+/// ("0.5 h") — a digest line, not a gauge. `pub(crate)`: the FR-9 weekly
+/// digest formats its contributors with the same convention, re-exported
+/// rather than re-declared.
+pub(crate) fn format_hours(h: f64) -> String {
     if h >= 10.0 {
         format!("{h:.0} h")
     } else if h >= 1.0 {

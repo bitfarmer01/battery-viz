@@ -13,6 +13,7 @@ use crate::capdetect::{self, CapMonitor, CapPromptAnswer, PromptRecord};
 use crate::caps::{Capabilities, MetricId, SettingGuidance, SettingKind};
 use crate::clock;
 use crate::collect::CollectorResult;
+use crate::digest::{DigestInputs, DigestSchedule, WeeklyDigest};
 use crate::history::HistoryStore;
 use crate::notify;
 use crate::outcomes::OutcomeStore;
@@ -72,6 +73,19 @@ pub struct App {
     /// read (it was preserved as `alert-outcomes.json.corrupt`) — never
     /// silent (M2 convention).
     pub outcomes_load_error: Option<String>,
+    /// FR-9 weekly digest schedule: the local day the last digest went
+    /// out, persisted so "at most one a week" survives restarts.
+    pub digest_schedule: DigestSchedule,
+    /// Where the schedule persists; `None` keeps it in memory only.
+    digest_state_path: Option<PathBuf>,
+    /// Sticky dashboard notice: the schedule file could not be read (it
+    /// was preserved as `digest-state.json.corrupt`) — never silent.
+    pub digest_load_error: Option<String>,
+    /// FR-0 answers, resolved once at startup like
+    /// `temperature_available`: they gate the digest's high-charge and
+    /// cycling contributors (an Unavailable metric is absent, never zero).
+    soc_available: bool,
+    cycles_available: bool,
     /// The advice-state marker file existed but could not be read or was not
     /// the expected marker: it was quarantined and the advice stays hidden —
     /// never silent (M2 convention).
@@ -313,6 +327,16 @@ impl App {
             }
             None => (None, OutcomeStore::new(), None),
         };
+        // FR-9: the weekly digest schedule lives next to the history file
+        // (same data dir, so the uninstall listing covers it with the
+        // rest). A fresh install anchors on its first day: the first
+        // digest is due a week later, when the record has a week of
+        // samples to speak from.
+        let digest_state_path = history_path
+            .as_ref()
+            .map(|p| p.with_file_name(crate::digest::DIGEST_STATE_FILE));
+        let (digest_schedule, digest_load_error) =
+            DigestSchedule::load(digest_state_path.as_deref(), clock::local_now().day);
         // Menu-bar agent mode (macOS, or any host started hidden): the window
         // exists but is not shown at launch; the tray / `--hidden` toggles it.
         let start_hidden =
@@ -371,6 +395,15 @@ impl App {
             outcomes,
             outcomes_path,
             outcomes_load_error,
+            digest_schedule,
+            digest_state_path,
+            digest_load_error,
+            soc_available: capabilities
+                .readable_metrics()
+                .contains(&MetricId::StateOfCharge),
+            cycles_available: capabilities
+                .readable_metrics()
+                .contains(&MetricId::CycleCount),
             advice_load_error,
             pending_record_seed,
             first_run_note: None,
@@ -492,6 +525,7 @@ impl App {
             self.benchmark = Some(benchmark::evaluate(&sample));
             self.latest = Some(sample);
         }
+        self.tick_digest();
     }
 
     /// FR-4: the week's warm-hour digest, or `None` when the feature hides
@@ -568,6 +602,50 @@ impl App {
             }
             self.save_outcomes_now();
         }
+    }
+
+    /// FR-9: deliver the weekly digest when it is due — at most one
+    /// notification a week, never during quiet hours, and never a
+    /// placeholder: a week with nothing recorded has nothing to say, so
+    /// the digest simply waits for a week that has data. Paused alerts
+    /// defer the digest too: the mute covers every nudge, and the schedule
+    /// keeps its one-a-week guarantee across the deferral.
+    fn tick_digest(&mut self) {
+        if self.alerts_paused {
+            return;
+        }
+        let local = self.local_clock();
+        if !self.digest_schedule.due(local.hour, local.day) {
+            return;
+        }
+        if let Some(digest) = self.weekly_digest() {
+            notify::send("Weekly digest", &digest.notification_body());
+            // Persist before the notification is even visible: a crash
+            // right after sending must never double-send next week.
+            if let Err(e) = self
+                .digest_schedule
+                .mark_sent(self.digest_state_path.as_deref(), local.day)
+            {
+                self.last_error = Some(format!("digest schedule could not be saved: {e}"));
+            }
+        }
+    }
+
+    /// FR-9: this week's digest, or `None` when it hides — the record has
+    /// no samples in the window. Assembled fresh from the daily record
+    /// (FR-7), the FR-4 warm report, the FR-6 outcome store, and the FR-0
+    /// adapter's availability answers; no platform logic lives here.
+    pub fn weekly_digest(&self) -> Option<WeeklyDigest> {
+        WeeklyDigest::build(DigestInputs {
+            record: &self.daily_record,
+            warm: self.weekly_heat_digest(),
+            soc_available: self.soc_available,
+            cycles_available: self.cycles_available,
+            cap_status: self.cap_monitor.status(),
+            cap_guidance: self.capabilities.guidance(SettingKind::ChargeCap),
+            outcomes: &self.outcomes,
+            now_day: self.local_clock().day,
+        })
     }
 
     /// Pause/unpause coaching nudges. Resetting the engine means a pause of

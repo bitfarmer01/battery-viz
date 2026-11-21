@@ -288,6 +288,16 @@ impl OutcomeStore {
         (total > 0).then_some((acted, total))
     }
 
+    /// FR-9: how many times `kind` fired (delivered or suppressed) on or
+    /// after local day `since_day` — the digest's measure of how often a
+    /// retired condition still recurs.
+    pub fn fire_count_since_day(&self, kind: AlertKind, since_day: u32) -> u32 {
+        self.fires
+            .iter()
+            .filter(|f| f.kind == kind && f.day >= since_day)
+            .count() as u32
+    }
+
     /// Serialize to the on-disk JSON schema:
     /// `{"version":1,"retire_after":3,"consecutive":[..],"retired":[..],
     ///   "fires":[[kind,day,fired_at,delivered,outcome],...]}`
