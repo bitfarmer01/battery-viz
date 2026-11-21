@@ -81,6 +81,10 @@ pub struct App {
     /// Sticky dashboard notice: the schedule file could not be read (it
     /// was preserved as `digest-state.json.corrupt`) — never silent.
     pub digest_load_error: Option<String>,
+    /// A schedule save that failed at send time is retried every tick
+    /// until it succeeds: the in-memory day already blocks a re-send, but
+    /// until the disk agrees, a restart would re-arm the digest early.
+    digest_save_pending: bool,
     /// FR-0 answers, resolved once at startup like
     /// `temperature_available`: they gate the digest's high-charge and
     /// cycling contributors (an Unavailable metric is absent, never zero).
@@ -266,47 +270,52 @@ impl App {
         });
         // The daily record (FR-7) lives next to the history file, same data
         // dir, so the uninstall listing covers both with one deletion.
-        let (daily_record, record_path, record_load_error, pending_record_seed) = match &history_path
-        {
-            Some(path) => {
-                let record_path = path.with_file_name("daily-record.json");
-                let record_load = DailyRecord::load(&record_path);
-                let record_load_error = record_load.load_error.as_ref().map(|e| {
+        let (daily_record, record_path, record_load_error, pending_record_seed) =
+            match &history_path {
+                Some(path) => {
+                    let record_path = path.with_file_name("daily-record.json");
+                    let record_load = DailyRecord::load(&record_path);
+                    let record_load_error = record_load.load_error.as_ref().map(|e| {
                     format!(
                         "prior daily record could not be read ({}) — starting fresh; preserved at {}",
                         e.message,
                         e.backup_path.display()
                     )
                 });
-                let record = record_load.record;
-                // First run: import the long-term record the machine
-                // already holds, asked through the capability adapter
-                // (Windows: powercfg /batteryreport; macOS: the ioreg
-                // LifetimeData counters). The Windows answer needs a
-                // subprocess that can take seconds, so it runs on a
-                // background thread and is applied whenever it lands
-                // (`poll_record_seed` on a later frame) — window creation
-                // must not stall on first run. Until then — or when the
-                // adapter reports nothing — the record is simply empty;
-                // nothing is invented.
-                let pending_record_seed = if record.rows.is_empty() {
-                    let record_path = record_path.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let caps = crate::caps::platform_capabilities();
-                        let _ = tx.send(crate::first_run::Import {
-                            seeds: caps.capacity_seed(),
-                            lifetime: caps.lifetime_record(),
+                    let record = record_load.record;
+                    // First run: import the long-term record the machine
+                    // already holds, asked through the capability adapter
+                    // (Windows: powercfg /batteryreport; macOS: the ioreg
+                    // LifetimeData counters). The Windows answer needs a
+                    // subprocess that can take seconds, so it runs on a
+                    // background thread and is applied whenever it lands
+                    // (`poll_record_seed` on a later frame) — window creation
+                    // must not stall on first run. Until then — or when the
+                    // adapter reports nothing — the record is simply empty;
+                    // nothing is invented.
+                    let pending_record_seed = if record.rows.is_empty() {
+                        let record_path = record_path.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let caps = crate::caps::platform_capabilities();
+                            let _ = tx.send(crate::first_run::Import {
+                                seeds: caps.capacity_seed(),
+                                lifetime: caps.lifetime_record(),
+                            });
                         });
-                    });
-                    Some((rx, record_path))
-                } else {
-                    None
-                };
-                (record, Some(record_path), record_load_error, pending_record_seed)
-            }
-            None => (DailyRecord::default(), None, None, None),
-        };
+                        Some((rx, record_path))
+                    } else {
+                        None
+                    };
+                    (
+                        record,
+                        Some(record_path),
+                        record_load_error,
+                        pending_record_seed,
+                    )
+                }
+                None => (DailyRecord::default(), None, None, None),
+            };
         // FR-6: the alert outcome store lives next to the history file,
         // same data dir, so the uninstall listing covers it with the rest.
         let (outcomes_path, outcomes, outcomes_load_error) = match &history_path {
@@ -398,6 +407,7 @@ impl App {
             digest_schedule,
             digest_state_path,
             digest_load_error,
+            digest_save_pending: false,
             soc_available: capabilities
                 .readable_metrics()
                 .contains(&MetricId::StateOfCharge),
@@ -611,6 +621,10 @@ impl App {
     /// defer the digest too: the mute covers every nudge, and the schedule
     /// keeps its one-a-week guarantee across the deferral.
     fn tick_digest(&mut self) {
+        // A save that failed at send time retries here every tick — ahead
+        // of the pause check, because closing the double-send window is
+        // bookkeeping, not a nudge.
+        self.retry_pending_digest_save();
         if self.alerts_paused {
             return;
         }
@@ -622,10 +636,47 @@ impl App {
             notify::send("Weekly digest", &digest.notification_body());
             // Persist before the notification is even visible: a crash
             // right after sending must never double-send next week.
+            // Send-before-persist remains an accepted tradeoff (PR #22
+            // review, advisory-1): persisting first would risk losing the
+            // digest entirely on a crash, while a crash between the two
+            // calls costs at most one duplicate next launch. A persist
+            // that outright fails is retried every tick below, which
+            // shrinks the stale-disk window from a week to one tick.
             if let Err(e) = self
                 .digest_schedule
                 .mark_sent(self.digest_state_path.as_deref(), local.day)
             {
+                self.last_error = Some(format!("digest schedule could not be saved: {e}"));
+                self.digest_save_pending = true;
+            }
+        }
+    }
+
+    /// Retry a schedule save that failed at send time, every tick, until
+    /// the disk carries the day the in-memory schedule already advanced
+    /// to — a restart before then would re-arm the digest inside the
+    /// same week.
+    fn retry_pending_digest_save(&mut self) {
+        if !self.digest_save_pending {
+            return;
+        }
+        match self
+            .digest_schedule
+            .persist(self.digest_state_path.as_deref())
+        {
+            Ok(()) => {
+                self.digest_save_pending = false;
+                // Clear only this feature's own sticky error, never one
+                // another store set in the meantime.
+                if self
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("digest schedule could not be saved"))
+                {
+                    self.last_error = None;
+                }
+            }
+            Err(e) => {
                 self.last_error = Some(format!("digest schedule could not be saved: {e}"));
             }
         }
@@ -727,7 +778,11 @@ impl App {
     pub fn answer_cap_prompt(&mut self, answer: CapPromptAnswer) {
         let mut pending = self.cap_prompt_record;
         pending.answered = Some(answer);
-        match self.cap_prompt_path.as_deref().map(|p| capdetect::save_record(p, pending)) {
+        match self
+            .cap_prompt_path
+            .as_deref()
+            .map(|p| capdetect::save_record(p, pending))
+        {
             Some(Ok(())) | None => self.cap_prompt_record = pending,
             Some(Err(e)) => {
                 self.last_error = Some(format!(
@@ -790,7 +845,11 @@ impl App {
         let mut record = self.cap_prompt_record;
         record.stretch = stretch;
         record.verdict = settled_verdict(self.cap_monitor.status());
-        match self.cap_prompt_path.as_deref().map(|p| capdetect::save_record(p, record)) {
+        match self
+            .cap_prompt_path
+            .as_deref()
+            .map(|p| capdetect::save_record(p, record))
+        {
             Some(Ok(())) | None => true,
             Some(Err(e)) => {
                 self.last_error = Some(format!("charge-cap state could not be saved: {e}"));
@@ -1328,7 +1387,10 @@ mod tests {
         let record_path = dir.join("daily-record.json");
         std::fs::write(&record_path, "{").unwrap();
         let app = app_at(Some(dir.join("history.json")));
-        assert!(app.daily_record.rows.is_empty(), "corrupt record starts fresh");
+        assert!(
+            app.daily_record.rows.is_empty(),
+            "corrupt record starts fresh"
+        );
         let notice = app
             .record_load_error
             .as_ref()
