@@ -463,6 +463,14 @@ impl App {
         self.full_charge_advice = self.adaptive_advice.clone();
     }
 
+    /// What the advice card's dismiss button does: take the card down for
+    /// the rest of the session and persist the once-ever flag so a restart
+    /// never rebuilds it (`mark_full_charge_advice_shown`).
+    pub fn dismiss_full_charge_advice(&mut self) {
+        self.full_charge_advice = None;
+        self.mark_full_charge_advice_shown();
+    }
+
     /// Record that the FR-5 advice has been said: persist the flag so it is
     /// never said again (even across restarts) and stop recomputing. The
     /// card itself stays up for the session until dismissed.
@@ -876,5 +884,141 @@ mod tests {
         let results = app.uninstall_results.clone().expect("per-path results");
         assert!(results.iter().all(Result::is_ok), "{results:?}");
         drop(tx);
+    }
+
+    // ---- FR-5: one-time advice card (render gating + shown state) ----
+
+    fn unsaid_advice() -> SettingAdvice {
+        SettingAdvice {
+            message: "check the maker tool".into(),
+            url: None,
+        }
+    }
+
+    /// A retained window showing deep daytime discharge on four local days
+    /// (yesterday and older): 30 daytime buckets near 95%, then 30 near 40%
+    /// — a ≥40-point swing reaching ≤45%, the pattern FR-5 advises on.
+    fn deep_discharge_buckets() -> Vec<crate::history::MinuteBucket> {
+        use crate::history::MinuteBucket;
+        let local = clock::local_now();
+        let now = crate::history::unix_now() as i64;
+        let utc_hour = now.rem_euclid(86_400) / 3_600;
+        let offset = (local.hour as i64 - utc_hour) * 3_600;
+        let today = (now + offset).div_euclid(86_400);
+        let mut buckets = Vec::new();
+        for day_age in 1..=4u64 {
+            let noon_unix = (today - day_age as i64) * 86_400 + 12 * 3_600 - offset;
+            for i in 0..60u64 {
+                let soc = if i < 30 { 95.0 } else { 40.0 };
+                buckets.push(MinuteBucket {
+                    minute: (noon_unix / 60 - i as i64) as u64,
+                    n: 1,
+                    soc_sum: soc,
+                    soc_n: 1,
+                    temp_sum: 0.0,
+                    temp_n: 0,
+                    watts_sum: 0.0,
+                    watts_n: 0,
+                    soh_sum: 0.0,
+                    soh_n: 0,
+                    chg_n: 0,
+                    cycles_last: None,
+                });
+            }
+        }
+        buckets.sort_by_key(|b| b.minute);
+        buckets
+    }
+
+    #[test]
+    fn fr5_advice_appears_only_when_the_detector_fires_and_an_adaptive_equivalent_exists() {
+        // Detector fires + the adapter has guidance: the card goes up.
+        let mut app = app_at(None);
+        app.adaptive_advice = Some(unsaid_advice());
+        app.history_store.buckets = deep_discharge_buckets();
+        app.recompute_full_charge_advice();
+        assert_eq!(app.full_charge_advice, Some(unsaid_advice()));
+
+        // A maker module with no adaptive equivalent: the feature hides
+        // entirely, even though the history pattern is there.
+        let mut app = app_at(None);
+        app.adaptive_advice = None;
+        app.history_store.buckets = deep_discharge_buckets();
+        app.recompute_full_charge_advice();
+        assert!(app.full_charge_advice.is_none(), "no guidance → no card");
+
+        // Well-behaved history (fresh install): nothing to advise on.
+        let mut app = app_at(None);
+        app.adaptive_advice = Some(unsaid_advice());
+        app.recompute_full_charge_advice();
+        assert!(app.full_charge_advice.is_none(), "no pattern → no card");
+    }
+
+    #[test]
+    fn dismissing_the_advice_persists_the_shown_state_across_a_restart() {
+        let dir = tagged_dir("advice-dismiss");
+        let path = dir.join("history.json");
+        let mut app = app_at(Some(path.clone()));
+        app.adaptive_advice = Some(unsaid_advice());
+        app.history_store.buckets = deep_discharge_buckets();
+        app.recompute_full_charge_advice();
+        assert!(
+            app.full_charge_advice.is_some(),
+            "detector fires before dismissal"
+        );
+
+        // What the card's dismiss button calls.
+        app.dismiss_full_charge_advice();
+        assert!(app.full_charge_advice.is_none(), "card closes at once");
+        assert!(app.advice_shown);
+        let state_path = dir.join("advice-state.json");
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            ADVICE_SHOWN_MARKER,
+            "once-ever flag persisted"
+        );
+
+        // Persist the history too, so the restart below reloads the same
+        // deep-discharge pattern: even then the card must never reappear.
+        app.save_history_now();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let restarted = App::with_history_path(rx, Some(path));
+        assert!(restarted.advice_shown, "flag survives the restart");
+        assert!(
+            restarted.full_charge_advice.is_none(),
+            "pattern still in the window, but the advice was said once ever"
+        );
+        assert!(!dir.join("advice-state.json.corrupt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn advice_stays_down_once_shown_even_as_more_history_arrives() {
+        let mut app = app_at(None);
+        app.adaptive_advice = Some(unsaid_advice());
+        app.full_charge_advice = Some(unsaid_advice());
+        app.advice_shown = false;
+
+        // Card is up; new minute-buckets keep landing → recompute must not
+        // churn or downgrade it, and dismissal must stop the rebuild.
+        app.recompute_full_charge_advice();
+        assert_eq!(app.full_charge_advice, Some(unsaid_advice()));
+        app.dismiss_full_charge_advice();
+        app.recompute_full_charge_advice();
+        assert!(
+            app.full_charge_advice.is_none(),
+            "said once ever, never rebuilt"
+        );
+    }
+
+    #[test]
+    fn unreadable_advice_state_file_counts_as_shown() {
+        // The once-ever guarantee must not silently reset on a crash: an
+        // existing but unreadable marker file means "already said".
+        let dir = tagged_dir("advice-corrupt");
+        std::fs::write(dir.join("advice-state.json"), "{").unwrap();
+        let app = app_at(Some(dir.join("history.json")));
+        assert!(app.advice_shown, "corrupt marker counts as said");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
