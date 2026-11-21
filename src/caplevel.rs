@@ -1,9 +1,10 @@
 //! FR-2 (longevity roadmap): cap-level recommendation.
 //!
 //! From the recorded daily history (FR-7's store), measure how deep the
-//! user actually drains while unplugged — the deepest day's unplugged
-//! discharge range — and recommend the lowest cap level that leaves a 20%
-//! reserve above that usage. Which levels exist on a machine is never
+//! user actually drains while unplugged — the deepest unplugged drain
+//! window (a drain spanning midnight merges its two partial daily rows) —
+//! and recommend the lowest cap level that leaves a 20% reserve above that
+//! usage. Which levels exist on a machine is never
 //! guessed here: the FR-0 capability adapter reports the cap options
 //! (macOS 80–100% in 5% steps; Windows: whatever the maker module offers).
 //! When the adapter reports no cap control, or no offered level covers the
@@ -49,8 +50,9 @@ pub const RESERVE_PCT: f64 = 20.0;
 pub struct CapRecommendation {
     /// The lowest offered cap level that still covers the usage, percent.
     pub level_pct: u8,
-    /// Deepest daily unplugged discharge observed, in percentage points
-    /// (the day's unplugged high minus its unplugged low, deepest day).
+    /// Deepest unplugged drain window observed, in percentage points
+    /// (a drain spanning midnight reads as one window: highest unplugged
+    /// peak minus lowest unplugged dip across the window's days).
     pub usage_pct: f64,
     /// Qualified days the statistic is built from (≥ [`MIN_HISTORY_DAYS`]).
     pub days: u32,
@@ -70,7 +72,7 @@ pub enum CapAssessment {
     /// The recorded usage is deeper than any cap level the machine offers;
     /// recommending one would under-cover it, so the app says so instead.
     NoFit {
-        /// Deepest daily unplugged discharge observed, percentage points.
+        /// Deepest unplugged drain window observed, percentage points.
         usage_pct: f64,
         /// Qualified days the statistic is built from.
         days: u32,
@@ -87,22 +89,41 @@ pub fn assess(record: &DailyRecord, options: &CapOptions) -> CapAssessment {
     }
     // Qualified normal days gate the history, exactly as before: a day with
     // too few SoC readings never counts, and exclusion of thin days only
-    // lowers the day count (more `NeedHistory`), never the target.
+    // lowers the day count (more `NeedHistory`), never the target. A day
+    // written before discharge tracking existed (v1/v2 era) does not count
+    // either (review MEDIUM 1): blind history must not qualify a
+    // recommendation on data it does not have.
     //
-    // The usage statistic (re-audit N1): the deepest single day's unplugged
-    // discharge range — how far below its unplugged peak the user actually
-    // took the pack. A machine that never unplugs has no range on any day
-    // and reads as zero usage; a parked level is not consumption.
+    // The usage statistic (re-audit N1; review HIGH): the deepest unplugged
+    // drain window. A drain that spans midnight splits across two daily
+    // rows — 22:00 → 02:00 appears as a partial range on each day — so
+    // rows whose days are consecutive and both carry discharge data merge
+    // into one window (top = highest unplugged peak, bottom = lowest
+    // unplugged dip) instead of understating the depth as two partial
+    // days. A machine that never unplugs has no range on any day and reads
+    // as zero usage; a parked level is not consumption.
     let mut days = 0u32;
     let mut deepest: Option<f64> = None;
+    // Current run: (last day, window top, window bottom) over consecutive
+    // days with discharge data; any day without discharge data (parked) or
+    // a day-number gap (machine off, no row) ends the window.
+    let mut run: Option<(u32, f64, f64)> = None;
     for row in &record.rows {
-        if row.soc_n < MIN_DAY_SAMPLES {
-            continue;
-        }
-        days += 1;
         if let (Some(max), Some(min)) = (row.disch_max, row.disch_min) {
-            let usage = max - min;
-            deepest = Some(deepest.map_or(usage, |d: f64| d.max(usage)));
+            run = match run {
+                Some((prev_day, top, bottom)) if row.day == prev_day + 1 => {
+                    Some((row.day, top.max(max), bottom.min(min)))
+                }
+                _ => Some((row.day, max, min)),
+            };
+            let (_, top, bottom) = run.expect("run just set");
+            let window = top - bottom;
+            deepest = Some(deepest.map_or(window, |d: f64| d.max(window)));
+        } else {
+            run = None;
+        }
+        if row.soc_n >= MIN_DAY_SAMPLES && row.disch_tracked {
+            days += 1;
         }
     }
     if days < MIN_HISTORY_DAYS {
@@ -407,5 +428,91 @@ mod tests {
                 days: 7
             })
         );
+    }
+
+    /// Fold a drain that starts on `day` and reaches its bottom the next
+    /// day — unplugged from `top` down to `mid` on day `d`, then (still
+    /// unplugged, past midnight) from `mid` down to `bottom` on day `d+1`,
+    /// before topping back up on AC. Each day folds enough SoC samples to
+    /// qualify.
+    fn fold_spanning_drain(rec: &mut DailyRecord, d: u32, top: f64, mid: f64, bottom: f64) {
+        for i in 0..MIN_DAY_SAMPLES {
+            let soc = top - (top - mid) * i as f64 / (MIN_DAY_SAMPLES - 1) as f64;
+            rec.fold(&unplugged(soc), d);
+        }
+        for i in 0..MIN_DAY_SAMPLES {
+            let soc = mid - (mid - bottom) * i as f64 / (MIN_DAY_SAMPLES - 1) as f64;
+            rec.fold(&unplugged(soc), d + 1);
+        }
+        let s = crate::collect::BatterySample {
+            state_of_charge: Some(100.0),
+            ..Default::default()
+        };
+        for _ in 0..MIN_DAY_SAMPLES {
+            rec.fold(&s, d + 1);
+        }
+    }
+
+    /// Review HIGH: a drain spanning midnight splits into two partial daily
+    /// ranges. The two consecutive days must merge into ONE window, or the
+    /// statistic understates the depth (the exact N1 harm recurring): a
+    /// 100% → 60% evening and 60% → 8% overnight is a 92-point drain and
+    /// must read `NoFit`, not a comfortable partial-day answer.
+    #[test]
+    fn midnight_spanning_drain_counts_as_one_window() {
+        let mut rec = DailyRecord::default();
+        fold_spanning_drain(&mut rec, 0, 100.0, 60.0, 8.0);
+        // Fill to seven qualified days (day 1 of the drain plus repeats).
+        for day in 2..7u32 {
+            fold_usage_day(&mut rec, day, 100.0, 8.0);
+        }
+        assert_eq!(
+            assess(&rec, &MAC),
+            CapAssessment::NoFit {
+                usage_pct: 92.0,
+                days: 7
+            }
+        );
+    }
+
+    /// Review HIGH, the boundary: two separate drains on consecutive days
+    /// (each ending back on AC at 100%) must NOT sum — the window reads the
+    /// range of the spans, here 100 − 60 = 40, not 92. Merging covers a
+    /// single continuous drain; it never fabricates depth across a recharge.
+    #[test]
+    fn separate_drains_on_consecutive_days_do_not_sum() {
+        let mut rec = DailyRecord::default();
+        fold_usage_day(&mut rec, 0, 100.0, 60.0);
+        fold_usage_day(&mut rec, 1, 100.0, 60.0);
+        for day in 2..7u32 {
+            fold_usage_day(&mut rec, day, 100.0, 60.0);
+        }
+        assert_eq!(
+            assess(&rec, &MAC),
+            CapAssessment::Recommend(CapRecommendation {
+                level_pct: 80,
+                usage_pct: 40.0,
+                days: 7
+            })
+        );
+    }
+
+    /// Review MEDIUM 1: days recorded before discharge tracking existed
+    /// (v1/v2 era) qualify nothing — blind history must not yield an
+    /// immediate, floor-anchored recommendation the moment the app
+    /// upgrades. Seven blind days read `NeedHistory { days: 0 }`.
+    #[test]
+    fn blind_legacy_days_do_not_qualify_the_recommendation() {
+        let mut rows = String::new();
+        for day in 0..7u32 {
+            if !rows.is_empty() {
+                rows.push(',');
+            }
+            // v2 arity: day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min
+            rows.push_str(&format!("[{day},7200,180.0,2,120,0,0,3600,50.0]"));
+        }
+        let v2 = format!("{{\"version\":2,\"rows\":[{rows}]}}");
+        let rec = DailyRecord::from_json(&v2).expect("v2 parses");
+        assert_eq!(assess(&rec, &MAC), CapAssessment::NeedHistory { days: 0 });
     }
 }

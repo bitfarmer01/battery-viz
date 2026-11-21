@@ -157,7 +157,11 @@ impl WeeklyDigest {
         // charge (the row counts only samples meaningfully above the
         // high-charge threshold — re-audit N3: a machine correctly holding
         // AT its 80% cap accrues none), so the sum is real whenever the
-        // adapter reads state of charge at all.
+        // adapter reads state of charge at all. Legacy-era rows (written
+        // before the N3 threshold change) had their high-charge stock
+        // retired at load — review LOW 1 — so the sum never describes
+        // old-threshold hours under the new threshold's wording; the
+        // first post-upgrade week can only under-report, never mislabel.
         let high_charge_hours = if input.soc_available {
             Some(window.iter().map(|r| r.high_hours()).sum())
         } else {
@@ -507,6 +511,7 @@ mod tests {
             disch_n: 0,
             disch_min: None,
             disch_max: None,
+            disch_tracked: true,
         }
     }
 

@@ -43,12 +43,19 @@ pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
 pub const MAX_DAYS: usize = 10 * 366;
 
 /// On-disk schema version. A mismatch is treated as a corrupt file.
-/// Version 3 adds per-day unplugged-discharge tracking (`disch_n`,
-/// `disch_min`, `disch_max`) for FR-2's usage-based cap recommendation
-/// (re-audit N1); version 2 rows (9 fields) still parse with those fields
-/// absent, and version 1 rows (7 fields) with the SoC fields absent too —
-/// those days contribute no discharge range rather than a guessed one.
-const SCHEMA_VERSION: f64 = 3.0;
+/// Version 4 keeps version 3's row layout: the bump marks the threshold
+/// era — from v4 on, `high_n` counts samples above the N3 dwell threshold
+/// (band top + hysteresis) rather than at-or-above exactly 80%, so rows
+/// parsed from older versions have their legacy `high_n` retired to zero
+/// once at load, exactly like the live dwell total (review LOW 1 /
+/// MEDIUM 2: last week's hours must not be re-labeled under wording they
+/// were never counted for). Version 3 added per-day unplugged-discharge
+/// tracking (`disch_n`, `disch_min`, `disch_max`) for FR-2's usage-based
+/// cap recommendation (re-audit N1); version 2 rows (9 fields) still
+/// parse with those fields absent, and version 1 rows (7 fields) with
+/// the SoC fields absent too — those days contribute no discharge range
+/// rather than a guessed one. Known versions are matched exactly.
+const SCHEMA_VERSION: f64 = 4.0;
 
 /// One day's summary. Sums + counts per metric so a partially-populated
 /// day (missing temperature on Windows, say) never poisons the mean.
@@ -82,6 +89,13 @@ pub struct DailyRow {
     /// Highest state of charge observed while unplugged that day, percent.
     /// `None` when no unplugged sample carried a state of charge.
     pub disch_max: Option<f64>,
+    /// Whether this day's format ever tracked unplugged discharge. Rows
+    /// written by the tracking build (schema v3+) carry it; days parsed
+    /// from v1/v2 files observed no discharge tracking, and a blind day
+    /// must never qualify the recommendation gate on data it does not
+    /// have (review MEDIUM 1). Derived at parse/fold time, never
+    /// serialized.
+    pub disch_tracked: bool,
 }
 
 impl DailyRow {
@@ -99,6 +113,7 @@ impl DailyRow {
             disch_n: 0,
             disch_min: None,
             disch_max: None,
+            disch_tracked: true,
         }
     }
 
@@ -163,6 +178,10 @@ impl DailyRecord {
         };
         let row = &mut self.rows[idx];
         row.n += 1;
+        // The tracking build observes this day from here on: even a day
+        // first written by an older schema now carries real discharge
+        // tracking (review MEDIUM 1).
+        row.disch_tracked = true;
         if let Some(v) = s.state_of_charge {
             row.soc_n += 1;
             // FR-2: the day's lowest charge. A one-sample sensor glitch
@@ -230,13 +249,13 @@ impl DailyRecord {
         added
     }
 
-    /// Serialize to the on-disk JSON schema (v3):
-    /// `{"version":3,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min,disch_n,disch_min,disch_max],...]}`
+    /// Serialize to the on-disk JSON schema (v4):
+    /// `{"version":4,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min,disch_n,disch_min,disch_max],...]}`
     /// (cycles, soc_min and the discharge bounds are NaN when unknown).
     /// Rust's f64 Display round-trips.
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(110 * self.rows.len() + 32);
-        out.push_str("{\"version\":3,\"rows\":[");
+        out.push_str(&format!("{{\"version\":{},\"rows\":[", SCHEMA_VERSION));
         for (i, r) in self.rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -270,16 +289,26 @@ impl DailyRecord {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        if !(1.0..=SCHEMA_VERSION).contains(&version) {
+        // Known versions only, exactly (review LOW 2): 1, 2, 3 and 4 ever
+        // existed; anything else — past or future — is corruption here.
+        if !matches!(version, 1.0 | 2.0 | 3.0 | 4.0) {
             return Err(format!("unsupported schema version {version}"));
         }
         // Version 1 rows carry 7 fields (no SoC tracking); version 2, 9;
-        // version 3, 12 (adds the unplugged discharge range).
+        // versions 3 and 4, 12 (adds the unplugged discharge range).
         let arity = match version {
             1.0 => 7,
             2.0 => 9,
             _ => 12,
         };
+        // Threshold era (review LOW 1): a row written before v4 counted
+        // `high_n` at or above exactly 80% — including a correctly capped
+        // machine's entire hold. Such hours must not be re-labeled as time
+        // above the current threshold, so the legacy stock retires once at
+        // load, exactly like the live dwell total.
+        let legacy_era = version < 4.0;
+        // Discharge tracking (review MEDIUM 1): a v1/v2 day observed none.
+        let disch_tracked = version >= 3.0;
         p.skip_ws();
         p.expect(b',')?;
         p.expect_key("rows")?;
@@ -338,13 +367,14 @@ impl DailyRecord {
                 } else {
                     Some(cycles as u32)
                 },
-                high_n: f[5] as u32,
+                high_n: if legacy_era { 0 } else { f[5] as u32 },
                 warm_n: f[6] as u32,
                 soc_n: if arity >= 9 { f[7] as u32 } else { 0 },
                 soc_min,
                 disch_n: if arity == 12 { f[9] as u32 } else { 0 },
                 disch_min: pct(10)?,
                 disch_max: pct(11)?,
+                disch_tracked,
             });
             p.skip_ws();
             if !p.eat(b',') {
@@ -450,7 +480,11 @@ mod tests {
         assert_eq!(rec.rows.len(), 1);
         assert_eq!(rec.rows[0].soc_n, 0);
         assert_eq!(rec.rows[0].soc_min, None);
-        assert_eq!(rec.rows[0].high_n, 1);
+        // Legacy-era hours retire at load (review LOW 1): the row counted
+        // `high_n` at or above exactly 80% — possibly a correctly capped
+        // machine's whole hold — so the stock zeroes rather than being
+        // re-labeled under the new threshold's wording.
+        assert_eq!(rec.rows[0].high_n, 0);
         // …and folding a new sample into that v1 day starts the minimum
         // from the new sample alone (earlier lows are unknowable).
         let mut rec = rec;
@@ -466,6 +500,35 @@ mod tests {
         let round = DailyRecord::from_json(&rec.to_json()).expect("parse");
         assert_eq!(round.rows[0].soc_min, Some(41.5));
         assert_eq!(round.rows[0].soc_n, 2);
+    }
+
+    #[test]
+    fn unknown_record_schema_version_is_corrupt() {
+        // Review LOW 2: known versions only, exactly — 1, 2, 3 and 4 ever
+        // existed. Anything else, past or future, is corruption here, not a
+        // best-effort parse of a format nobody wrote.
+        for version in ["5.0", "2.5", "0.9"] {
+            let text = format!("{{\"version\":{version},\"rows\":[[3,2,180.0,2,120,1,0]]}}");
+            assert!(
+                DailyRecord::from_json(&text).is_err(),
+                "version {version} must not parse"
+            );
+        }
+        // All four known versions still load.
+        for version in ["1.0", "2.0", "3.0", "4.0"] {
+            let rows = if version == "1.0" {
+                "[3,2,180.0,2,120,1,0]"
+            } else if version == "2.0" {
+                "[3,2,180.0,2,120,1,0,2,45.5]"
+            } else {
+                "[3,2,180.0,2,120,1,0,2,45.5,1,60.0,80.0]"
+            };
+            let text = format!("{{\"version\":{version},\"rows\":[{rows}]}}");
+            assert!(
+                DailyRecord::from_json(&text).is_ok(),
+                "version {version} must parse"
+            );
+        }
     }
 
     /// A sample observed while unplugged (discharging).

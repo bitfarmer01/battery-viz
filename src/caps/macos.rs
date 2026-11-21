@@ -86,9 +86,14 @@ impl Capabilities for MacCapabilities {
     }
 
     fn lifetime_record(&self) -> Option<LifetimeRecord> {
-        // The lifetime counters sit in `LifetimeData` under the battery
-        // entry — but on macOS 27 the block moved to the child pack entry,
-        // so both places are asked and the first readable one wins.
+        // LifetimeData sits INSIDE the BatteryData child dict of the
+        // battery entry on real Apple-silicon macOS (verified on a
+        // MacBook Air M4, macOS 26.6.2 — re-audit N8; the previous
+        // top-level lookup silently found nothing on that machine, so
+        // first-run history import never ran). Both the battery entry
+        // and the child pack entry are asked; no top-level fallback is
+        // attempted because no evidence of that historical layout
+        // exists.
         let battery = ioreg_battery_dict("AppleSmartBattery");
         let pack = ioreg_battery_dict("AppleSmartBatteryPack");
         for dict in [battery, pack].into_iter().flatten() {
@@ -126,6 +131,12 @@ fn ioreg_battery_dict(name: &str) -> Option<plist::Dictionary> {
 
 /// The inferred `LifetimeData` layout, validated strictly.
 ///
+/// On real Apple-silicon macOS (MacBook Air M4, macOS 26.6.2 — re-audit
+/// N8) the `LifetimeData` block sits INSIDE the `BatteryData` child dict,
+/// not at the top level of the battery entry. Only that verified layout
+/// is read; a top-level block is not looked for because no evidence of
+/// that historical layout exists.
+///
 /// Only `TotalOperatingTime` is exported, because it is the only figure
 /// whose semantics survive scrutiny: it is lifetime hours, and it is a
 /// calendar-speed clock (it rises in sleep and with the lid shut), so it
@@ -139,7 +150,8 @@ fn ioreg_battery_dict(name: &str) -> Option<plist::Dictionary> {
 /// Anything else — key missing, wrong type, negative, beyond a sanity
 /// bound — fails silently: `None`, no import, no error (FR-8 acceptance).
 fn parse_lifetime_record(dict: &plist::Dictionary) -> Option<LifetimeRecord> {
-    let lifetime = dict.get("LifetimeData")?.as_dictionary()?;
+    let battery_data = dict.get("BatteryData")?.as_dictionary()?;
+    let lifetime = battery_data.get("LifetimeData")?.as_dictionary()?;
     let hours = lifetime.get("TotalOperatingTime")?.as_signed_integer()?;
     let hours_f = hours as f64;
     // Sanity bound: a pack cannot have outlived 23 years of continuous
@@ -193,7 +205,7 @@ mod tests {
         let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <plist version=\"1.0\">\n<array>\n  <dict>\n\
     <key>CycleCount</key><integer>214</integer>\n\
-    <key>CycleLimit</key><integer>1000</integer>\n\
+    <key>DesignCycleCount9C</key><integer>1000</integer>\n\
     <key>DesignCapacity</key><integer>58030</integer>\n\
     <key>NominalChargeCapacity</key><integer>53120</integer>\n\
     <key>Temperature</key><integer>2912</integer>\n\
@@ -209,6 +221,68 @@ mod tests {
                 m.is_present(&s),
                 caps.readable_metrics().contains(m),
                 "metric {m:?} declaration vs ioreg parse mismatch"
+            );
+        }
+    }
+
+    fn dict_from_xml(xml: &str) -> plist::Dictionary {
+        let v = plist::Value::from_reader(Cursor::new(xml.as_bytes())).expect("plist parse");
+        v.as_dictionary().expect("dictionary").clone()
+    }
+
+    #[test]
+    fn lifetime_record_reads_battery_data_nesting() {
+        // Verified real layout (MacBook Air M4, macOS 26.6.2 — re-audit
+        // N8): LifetimeData lives INSIDE BatteryData. The previous code
+        // read the top level and silently found nothing, so first-run
+        // import never ran on this machine.
+        let dict = dict_from_xml(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>BatteryData</key><dict>
+    <key>LifetimeData</key><dict>
+      <key>TotalOperatingTime</key><integer>12345</integer>
+    </dict>
+  </dict>
+</dict></plist>"#,
+        );
+        let record = parse_lifetime_record(&dict).expect("record from verified nesting");
+        assert_eq!(record.operating_hours, 12345.0);
+    }
+
+    #[test]
+    fn lifetime_record_ignores_top_level_lifetime_data() {
+        // Locks in the verified layout: a top-level LifetimeData block —
+        // the shape the old (broken) code looked for — is NOT read. No
+        // evidence of that historical layout exists, so the parser does
+        // not guess at it.
+        let dict = dict_from_xml(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>LifetimeData</key><dict>
+    <key>TotalOperatingTime</key><integer>12345</integer>
+  </dict>
+</dict></plist>"#,
+        );
+        assert!(parse_lifetime_record(&dict).is_none());
+    }
+
+    #[test]
+    fn lifetime_record_sanitizes_implausible_hours() {
+        for hours in ["0", "-5", "200001"] {
+            let dict = dict_from_xml(&format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>BatteryData</key><dict>
+    <key>LifetimeData</key><dict>
+      <key>TotalOperatingTime</key><integer>{hours}</integer>
+    </dict>
+  </dict>
+</dict></plist>"#
+            ));
+            assert!(
+                parse_lifetime_record(&dict).is_none(),
+                "hours {hours} must fail"
             );
         }
     }

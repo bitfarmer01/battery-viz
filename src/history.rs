@@ -30,8 +30,13 @@ pub const RETENTION_MINUTES: u64 = 7 * 24 * 60;
 /// margin, so clock jitter across restarts cannot evict fresh data.
 pub const MAX_BUCKETS: usize = RETENTION_MINUTES as usize + 480;
 
-/// On-disk schema version. A mismatch is treated as a corrupt file.
-const SCHEMA_VERSION: f64 = 1.0;
+/// On-disk schema version. Version 1 files still load (never quarantined);
+/// anything else unknown is corrupt. Version 2 exists because the N3
+/// re-audit changed the dwell rule: on first load of a v1 file, its
+/// `dwell_s` — accumulated under the old at-or-above-exactly-80% rule,
+/// including a correctly capped machine's entire hold — retires to zero
+/// and re-accrues under the new threshold (review MEDIUM 2).
+const SCHEMA_VERSION: f64 = 2.0;
 
 /// Why a persisted history file could not be loaded, and where the
 /// unreadable bytes were preserved.
@@ -206,11 +211,11 @@ impl HistoryStore {
     }
 
     /// Serialize to the on-disk JSON schema:
-    /// `{"version":1,"buckets":[[minute,n,...sums/counts...,chg,cycles],...]}`
+    /// `{"version":2,"buckets":[[minute,n,...sums/counts...,chg,cycles],...]}`
     /// (cycles is NaN when unknown). Rust's f64 Display round-trips.
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(170 * self.buckets.len() + 32);
-        out.push_str("{\"version\":1,\"buckets\":[");
+        out.push_str(&format!("{{\"version\":{},\"buckets\":[", SCHEMA_VERSION));
         for (i, b) in self.buckets.iter().enumerate() {
             if i > 0 {
                 out.push(',');
@@ -250,7 +255,8 @@ impl HistoryStore {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        if version != SCHEMA_VERSION {
+        // Known versions only, exactly: 1 (pre-N3 dwell rule) and 2.
+        if !matches!(version, 1.0 | 2.0) {
             return Err(format!("unsupported schema version {version}"));
         }
         p.skip_ws();
@@ -317,6 +323,17 @@ impl HistoryStore {
             }
             dwell_s = Some(d);
         }
+        // Review MEDIUM 2: a v1 total was accumulated under the old
+        // at-or-above-exactly-80% rule, so a machine correctly capped at
+        // 80% carries seconds it no longer deserves — with no accrual under
+        // the new threshold, the factor would stay pinned at its floor
+        // forever. The threshold change makes the old total incomparable:
+        // retire the legacy stock once at upgrade; it re-accrues under the
+        // new threshold from the live stream. A v1 file without the key is
+        // "never tracked" and stays `None`.
+        if version == 1.0 {
+            dwell_s = dwell_s.map(|_| 0.0);
+        }
         p.skip_ws();
         p.expect(b'}')?;
         Ok(HistoryStore { buckets, dwell_s })
@@ -376,9 +393,7 @@ impl HistoryStore {
                 field(b.soh_mean()),
                 field(b.temp_mean()),
                 field(b.watts_mean()),
-                b.cycles_last
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
+                b.cycles_last.map(|c| c.to_string()).unwrap_or_default(),
             ));
         }
         out
@@ -522,10 +537,9 @@ impl<'a> Parser<'a> {
     pub(crate) fn number(&mut self) -> Result<f64, String> {
         self.skip_ws();
         let start = self.i;
-        while self
-            .peek()
-            .is_some_and(|c| c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'N' | b'a' | b'n'))
-        {
+        while self.peek().is_some_and(|c| {
+            c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'N' | b'a' | b'n')
+        }) {
             self.i += 1;
         }
         let token = std::str::from_utf8(&self.b[start..self.i]).map_err(|_| "bad utf8")?;
@@ -604,10 +618,8 @@ mod tests {
     }
 
     fn temp_file(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "battery-viz-tests-{}-{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("battery-viz-tests-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("history.json")
     }
@@ -751,6 +763,36 @@ mod tests {
     }
 
     #[test]
+    fn v1_dwell_stock_retires_on_load() {
+        // Review MEDIUM 2: a v1 total accrued under the old
+        // at-or-above-exactly-80% rule — a correctly capped machine's whole
+        // hold included. The threshold change makes the stock incomparable,
+        // so it retires to tracked-at-zero on the upgrade load instead of
+        // pinning the factor at its floor forever.
+        let v1 = "{\"version\":1,\"buckets\":[[100,2,160.0,2,60.0,1,0.0,0,180.0,1,120]],\"dwell_s\":360000.0}";
+        let loaded = HistoryStore::from_json(v1).expect("v1 parses");
+        assert_eq!(loaded.dwell_s, Some(0.0), "legacy stock retired");
+        // A v1 file without the key was never tracking: it stays `None`.
+        let v1_plain = "{\"version\":1,\"buckets\":[[100,2,160.0,2,60.0,1,0.0,0,180.0,1,120]]}";
+        let loaded = HistoryStore::from_json(v1_plain).expect("v1 parses");
+        assert_eq!(loaded.dwell_s, None, "absent key stays never-tracked");
+        // A v2 total (already written under the new threshold) survives.
+        let v2 = "{\"version\":2,\"buckets\":[[100,2,160.0,2,60.0,1,0.0,0,180.0,1,120]],\"dwell_s\":42.0}";
+        let loaded = HistoryStore::from_json(v2).expect("v2 parses");
+        assert_eq!(loaded.dwell_s, Some(42.0), "current-era total preserved");
+    }
+
+    #[test]
+    fn unknown_history_schema_version_is_corrupt() {
+        // Known versions only, exactly (review LOW 2, same convention as
+        // the daily record): past AND future unknowns are corruption.
+        let future = "{\"version\":3,\"buckets\":[[100,2,160.0,2,60.0,1,0.0,0,180.0,1,120]]}";
+        assert!(HistoryStore::from_json(future).is_err());
+        let fractional = "{\"version\":1.5,\"buckets\":[[100,2,160.0,2,60.0,1,0.0,0,180.0,1,120]]}";
+        assert!(HistoryStore::from_json(fractional).is_err());
+    }
+
+    #[test]
     fn json_survives_nan_cycles_and_special_values() {
         let mut store = HistoryStore::default();
         store.push(&BatterySample::default(), MIN0); // all metrics missing
@@ -786,7 +828,7 @@ mod tests {
             "NaN",
             "0.0", // watts
             "90.0",
-            "2", // soh
+            "2",   // soh
             "NaN", // cycles
         );
         let text = format!("{{\"version\":1,\"buckets\":[{row}]}}");
@@ -798,7 +840,12 @@ mod tests {
 
     #[test]
     fn wrong_bucket_arity_is_rejected() {
-        let too_short = format!("{{\"version\":1,\"buckets\":[[{},{},{}]]}}", MIN0 / 60, 1, 1.0);
+        let too_short = format!(
+            "{{\"version\":1,\"buckets\":[[{},{},{}]]}}",
+            MIN0 / 60,
+            1,
+            1.0
+        );
         assert!(HistoryStore::from_json(&too_short).is_err());
     }
 

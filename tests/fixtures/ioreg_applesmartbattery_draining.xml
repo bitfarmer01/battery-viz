@@ -1,29 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Audit finding M4 fixture — provenance and labeling.
+  SYNTHETIC fixture — relabeled by re-audit finding N7.
 
-  PROVENANCE: The field values below are transcribed from a REAL machine
-  capture: a MacBook Air (macOS 27.2), published 2026-10-13 in the
-  purplelink.llc guide "Check your Mac battery health, cycle count and
-  voltage without installing anything" (retrieved 2026-11-20). First
-  reading: Voltage 11509 mV, Amperage -1415 mA, CurrentCapacity 57,
-  CycleCount 628, BatteryData DesignCapacity 4629 / NominalChargeCapacity
-  3925 / FullChargeCapacity 3798 mAh.
+  This file is NOT a real ioreg capture, and the previous header's claim
+  that its values were transcribed from a real "macOS 27.2" machine was
+  wrong and is retracted. The sandbox has no Mac, so `ioreg -r -n
+  AppleSmartBattery -d 1 -a -x` could not be captured here. Nothing in
+  this repository verifies real-hardware behavior; the platform
+  collectors remain fixture-tested only.
 
-  SYNTHESIZED WRAPPER: The sandbox has no Mac, so `ioreg -r -n
-  AppleSmartBattery -d 1 -a -x` could not be captured here. The XML plist
-  below reproduces the documented ioreg -a shape (array of dicts) around
-  the real values; BatteryData-nested values are surfaced at the top level
-  because the published capture's grep cut the root-level copies of those
-  keys. The source printed Amperage as an unsigned-wrapped 64-bit value
-  (18446744073709550201); the signed form -1415 shown here is the value
-  the source itself recovers via bash arithmetic and plutil.
+  The KEY LAYOUT mirrors what real Apple-silicon macOS emits as described
+  in re-audit finding N7 (observed on a MacBook Air M4, macOS 26.6.2):
+  Temperature present at top level, capacity and cycle data via
+  NominalChargeCapacity / DesignCapacity / DesignCycleCount9C (there is
+  no CycleLimit key on that machine), NO top-level FullChargeCapacity,
+  and a BatteryData child dict carrying nested copies of the firmware
+  values. The parser must read from either level.
 
-  KNOWN QUIRK, kept deliberately: this capture shows IsCharging = Yes while
-  the pack is net DISCHARGING (-1415 mA, AvgTimeToEmpty 87 min) because the
-  system load exceeded the 8 W adapter. The power sign must come from the
-  Amperage data, not from the IsCharging flag — this fixture locks that in.
-  The source capture also has NO Temperature key on this machine.
+  The numeric values are synthetic and kept from the earlier fixture
+  version. The scenario this synthetic encodes is deliberate and still
+  valid: IsCharging reads Yes while the pack is net DISCHARGING (-1415
+  mA, AvgTimeToEmpty 87 min) under a weak adapter. The power sign must
+  come from the Amperage data, not from the IsCharging flag — this
+  fixture locks that in. The previous header's claim that "the real
+  machine had NO Temperature key" is retracted: per re-audit N7 the
+  measured machine emits Temperature, and this fixture carries it.
 -->
 <plist version="1.0">
 <array>
@@ -31,15 +32,21 @@
     <key>Voltage</key><integer>11509</integer>
     <key>Amperage</key><integer>-1415</integer>
     <key>CurrentCapacity</key><integer>57</integer>
-    <key>MaxCapacity</key><integer>100</integer>
+    <key>Temperature</key><integer>3010</integer>
     <key>DesignCapacity</key><integer>4629</integer>
     <key>NominalChargeCapacity</key><integer>3925</integer>
-    <key>FullChargeCapacity</key><integer>3798</integer>
+    <key>DesignCycleCount9C</key><integer>1000</integer>
     <key>CycleCount</key><integer>628</integer>
     <key>AvgTimeToEmpty</key><integer>87</integer>
     <key>ExternalConnected</key><true/>
     <key>IsCharging</key><true/>
     <key>FullyCharged</key><false/>
+    <key>BatteryData</key>
+    <dict>
+      <key>DesignCapacity</key><integer>4629</integer>
+      <key>NominalChargeCapacity</key><integer>3925</integer>
+      <key>DesignCycleCount9C</key><integer>1000</integer>
+    </dict>
   </dict>
 </array>
 </plist>
