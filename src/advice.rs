@@ -155,3 +155,37 @@ struct DaySummary {
     min_soc: f64,
     n: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every shipping adapter answers BehavioralOnly for adaptive charging,
+    /// so the card may never claim to know (or set) the on/off state — it
+    /// asks the user to check, pointed at the adapter's guidance.
+    #[test]
+    fn behavioral_only_message_asks_the_user_to_check_and_never_claims_the_state() {
+        let advice = adaptive_charging_advice(&crate::caps::sim::SimCapabilities::new())
+            .expect("the simulator adapter has adaptive-charging guidance");
+        assert!(
+            advice.message.contains("check Simulator"),
+            "points at the adapter's tool: {}",
+            advice.message
+        );
+        assert!(
+            advice.message.contains("cannot read its state"),
+            "says so about not knowing the state: {}",
+            advice.message
+        );
+        let lower = advice.message.to_lowercase();
+        for claim in [
+            "is on", "is off", "turn on", "turn off", "enable", "disable",
+        ] {
+            assert!(
+                !lower.contains(claim),
+                "no on/off imperative ({claim}): {}",
+                advice.message
+            );
+        }
+    }
+}

@@ -223,6 +223,13 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
         });
     }
 
+    // FR-5 one-time advice card: rendered only while an unsaid advice is
+    // up (the detector fired and the adapter has an adaptive equivalent to
+    // point at). Dismissal persists the once-ever flag.
+    if full_charge_advice_visible(app) {
+        draw_full_charge_advice(ctx, app);
+    }
+
     egui::CentralPanel::default()
         .frame(
             egui::Frame::default()
@@ -560,6 +567,46 @@ fn draw_weekly_digest(ui: &mut egui::Ui, app: &App) {
     )).small());
 }
 
+/// FR-5 render gate: the card shows exactly while an unsaid advice is up.
+/// Every real hide gate lives upstream in `App` — the deep-discharge
+/// detector (advice::regular_deep_daytime_discharge), the adapter's
+/// adaptive equivalent (`None` hides the feature entirely, e.g. a maker
+/// module with no adaptive charging), and the persisted once-ever flag. The
+/// card's message comes from the adapter too, so on every shipping platform
+/// (all BehavioralOnly) it asks the user to check the setting rather than
+/// claiming to know whether it is on.
+fn full_charge_advice_visible(app: &App) -> bool {
+    app.full_charge_advice.is_some()
+}
+
+/// FR-5 one-time advice card. Say-so-once UX: shown at most one time ever;
+/// dismissing takes it down for the session and persists the shown flag, so
+/// neither more arriving history nor an app restart can bring it back.
+fn draw_full_charge_advice(ctx: &egui::Context, app: &mut App) {
+    let Some(advice) = app.full_charge_advice.clone() else {
+        return;
+    };
+    egui::TopBottomPanel::top("full_charge_advice_card").show(ctx, |ui| {
+        // Top-down primitives only, dismiss button last: a horizontal row
+        // mid-panel gets its height from the frame-1 panel-size hint and
+        // anything after it can be culled before the hint settles.
+        ui.colored_label(
+            egui::Color32::from_rgb(120, 190, 240),
+            "🔋 Adaptive charging — worth checking once",
+        );
+        ui.label(&advice.message);
+        if let Some(url) = advice.url {
+            ui.hyperlink(url);
+        }
+        ui.horizontal(|ui| {
+            if ui.small_button("Got it").clicked() {
+                app.dismiss_full_charge_advice();
+            }
+        });
+        ui.add_space(6.0);
+    });
+}
+
 /// Modal confirm: what gets deleted (only paths that exist), what does not,
 /// and Cancel / Delete everything.
 fn draw_uninstall_confirm(ctx: &egui::Context, app: &mut App) {
@@ -669,4 +716,98 @@ fn draw_uninstall_finish(
                 app.quit_requested = true;
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::advice::SettingAdvice;
+
+    fn test_app() -> App {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        App::with_history_path(rx, None)
+    }
+
+    #[test]
+    fn advice_card_gate_is_exactly_an_unsaid_advice() {
+        let mut app = test_app();
+        assert!(
+            !full_charge_advice_visible(&app),
+            "no advice computed → no card (fresh install, no pattern, or already said)"
+        );
+        app.full_charge_advice = Some(SettingAdvice {
+            message: "check the maker tool".into(),
+            url: None,
+        });
+        assert!(
+            full_charge_advice_visible(&app),
+            "unsaid advice → card shows"
+        );
+        // Dismissal is the only way the card goes down mid-session.
+        app.dismiss_full_charge_advice();
+        assert!(!full_charge_advice_visible(&app), "dismissed → card hidden");
+    }
+
+    /// Every string painted into a frame (text galleys), for asserting what
+    /// actually rendered — not just that the frame did not panic.
+    fn painted_texts(out: &egui::FullOutput) -> String {
+        let mut text = String::new();
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(t) = &clipped.shape {
+                text.push_str(t.galley.text());
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    const CARD_HEADING: &str = "Adaptive charging — worth checking once";
+
+    /// One full dashboard frame rendered headlessly (CPU-side tessellation).
+    fn headless_frame(
+        ctx: &egui::Context,
+        app: &mut App,
+        export_status: &mut Option<String>,
+    ) -> egui::FullOutput {
+        ctx.run(egui::RawInput::default(), |ctx| {
+            draw(ctx, app, export_status);
+        })
+    }
+
+    #[test]
+    fn advice_card_draws_headless_only_while_gated_on() {
+        // Headless egui run: tessellation is CPU-side, so the whole draw
+        // path (card included) executes without a GPU. Two frames — panel
+        // size hints settle on the second, so that is the frame asserted on.
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let mut export_status: Option<String> = None;
+        let out_hidden = headless_frame(&ctx, &mut app, &mut export_status);
+        assert!(
+            !painted_texts(&out_hidden).contains(CARD_HEADING),
+            "no card may render while the gate is off"
+        );
+
+        app.full_charge_advice = Some(SettingAdvice {
+            message: "check the maker tool".into(),
+            url: Some("https://example.com/adaptive-charging"),
+        });
+        // First frame after the gate turns on sizes the new panel; the next
+        // frame is the settled one.
+        headless_frame(&ctx, &mut app, &mut export_status);
+        let out_shown = headless_frame(&ctx, &mut app, &mut export_status);
+        let painted = painted_texts(&out_shown);
+        assert!(
+            painted.contains(CARD_HEADING),
+            "card heading painted: {painted}"
+        );
+        assert!(
+            painted.contains("check the maker tool"),
+            "the adapter's guidance message is what the card shows; painted:\n{painted}"
+        );
+        assert!(
+            painted.contains("Got it"),
+            "the dismiss button renders; painted:\n{painted}"
+        );
+    }
 }
