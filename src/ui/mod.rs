@@ -216,6 +216,12 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
+            // FR-9: the digest schedule could not be read — sticky, never
+            // silent (the weekly clock restarted from today).
+            if let Some(err) = &app.digest_load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
+            }
             ui.separator();
             let pause_label = if app.alerts_paused {
                 "▶ Resume alerts"
@@ -283,6 +289,7 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 draw_live_gauges(ui, app);
                 draw_plots(ui, app);
                 draw_trends(ui, app, export_status);
+                draw_weekly_summary(ui, app);
                 draw_weekly_digest(ui, app);
                 draw_alert_outcomes(ui, app);
             });
@@ -700,6 +707,31 @@ fn draw_trends(ui: &mut egui::Ui, app: &App, export_status: &mut Option<String>)
             ui.weak(egui::RichText::new(status.as_str()).small());
         }
     });
+}
+
+/// FR-9 weekly digest — what aged the battery this week and the single
+/// action worth taking. Drawn only when the week's record has samples:
+/// an empty record renders nothing at all — no heading, no placeholder —
+/// and a contributor the FR-0 adapter reports Unavailable is simply
+/// absent from the panel, never a zero presented as a reading.
+fn draw_weekly_summary(ui: &mut egui::Ui, app: &App) {
+    let Some(digest) = app.weekly_digest() else {
+        return;
+    };
+    ui.add_space(8.0);
+    ui.heading("Weekly digest");
+    ui.add_space(2.0);
+    for line in digest.panel_lines() {
+        ui.label(line);
+    }
+    ui.label(egui::RichText::new(digest.action.line()).strong());
+    ui.weak(
+        egui::RichText::new(
+            "Delivered as at most one notification a week, only outside quiet hours \
+             (after 08:00 local). Retired alert types report here instead of in real time.",
+        )
+        .small(),
+    );
 }
 
 /// FR-4 weekly digest — heat. Drawn only when the app has a report: the

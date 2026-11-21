@@ -15,6 +15,7 @@ mod caplevel;
 mod caps;
 mod clock;
 mod collect;
+mod digest;
 mod dwell;
 mod first_run;
 mod history;
