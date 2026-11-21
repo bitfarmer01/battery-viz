@@ -1,7 +1,7 @@
 //! Application state: drains the collector channel, keeps a bounded history
 //! ring, and re-evaluates the benchmark as samples arrive.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
@@ -59,6 +59,10 @@ pub struct App {
     record_path: Option<PathBuf>,
     /// Sticky dashboard notice: the persisted record could not be read.
     pub record_load_error: Option<String>,
+    /// The advice-state marker file existed but could not be read or was not
+    /// the expected marker: it was quarantined and the advice stays hidden —
+    /// never silent (M2 convention).
+    pub advice_load_error: Option<String>,
     /// First-run import (FR-8), still running in the background: the
     /// capacity rows (Windows: `powercfg /batteryreport`) plus, when the
     /// machine holds one, the battery's own lifetime record (macOS: the
@@ -159,6 +163,34 @@ pub fn default_history_path() -> Option<PathBuf> {
 const ADVICE_STATE_FILE: &str = "advice-state.json";
 const ADVICE_SHOWN_MARKER: &str = "{\"adaptive_charging_advice_shown\":true}";
 
+/// Read the FR-5 one-shot marker: `(said, notice)`. A missing file is a
+/// fresh start. An existing but unreadable or unrecognized marker counts as
+/// said — deliberate: the once-ever guarantee must not silently reset on a
+/// crash — but never silently: the bytes are quarantined like history
+/// (M1/M2) and the notice is surfaced on the dashboard, sticky.
+fn read_advice_shown(path: &Path) -> (bool, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Ok(text) if text.trim() == ADVICE_SHOWN_MARKER => (true, None),
+        read => {
+            let reason = match read {
+                Ok(_) => "not a recognized marker".to_string(),
+                Err(e) => format!("unreadable: {e}"),
+            };
+            let err = crate::history::quarantine(path, format!("advice state {reason}"));
+            (
+                true,
+                Some(format!(
+                    "advice state could not be read ({}) — the one-time advice \
+                     will not be offered again; preserved at {}",
+                    err.message,
+                    err.backup_path.display()
+                )),
+            )
+        }
+    }
+}
+
 impl App {
     pub fn new(rx: Receiver<CollectorResult>) -> Self {
         Self::with_history_path(rx, default_history_path())
@@ -238,15 +270,10 @@ impl App {
             .as_ref()
             .and_then(|p| p.parent())
             .map(|dir| dir.join(ADVICE_STATE_FILE));
-        let advice_shown = advice_state_path.as_deref().is_some_and(|path| {
-            match std::fs::read_to_string(path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Ok(text) if text.contains("adaptive_charging_advice_shown\":true") => true,
-                // Existing but unreadable or corrupt: assume said. The
-                // once-ever guarantee must not silently reset on a crash.
-                _ => true,
-            }
-        });
+        let (advice_shown, advice_load_error) = advice_state_path
+            .as_deref()
+            .map(read_advice_shown)
+            .unwrap_or((false, None));
         let mut app = App {
             rx,
             latest: None,
@@ -266,6 +293,7 @@ impl App {
             daily_record,
             record_path,
             record_load_error,
+            advice_load_error,
             pending_record_seed,
             first_run_note: None,
             buckets_since_save: 0,
@@ -478,19 +506,26 @@ impl App {
             return;
         }
         self.full_charge_advice = self.adaptive_advice.clone();
-    }
-
-    /// What the advice card's dismiss button does: take the card down for
-    /// the rest of the session and persist the once-ever flag so a restart
-    /// never rebuilds it (`mark_full_charge_advice_shown`).
-    pub fn dismiss_full_charge_advice(&mut self) {
-        self.full_charge_advice = None;
+        // Mark at raise, not at dismiss: the once-ever contract is "shown at
+        // most one time ever", so quitting with the card up must not re-show
+        // it on the next launch. Dismissal is purely the hide-now case.
         self.mark_full_charge_advice_shown();
     }
 
-    /// Record that the FR-5 advice has been said: persist the flag so it is
-    /// never said again (even across restarts) and stop recomputing. The
-    /// card itself stays up for the session until dismissed.
+    /// What the advice card's dismiss button does: persist the once-ever flag
+    /// (idempotent — the raise already marked it) before the card leaves the
+    /// UI, so a crash or a failed write can never lose a said advice, then
+    /// take the card down for the rest of the session.
+    pub fn dismiss_full_charge_advice(&mut self) {
+        self.mark_full_charge_advice_shown();
+        self.full_charge_advice = None;
+    }
+
+    /// Record that the FR-5 advice has been said: called the moment the card
+    /// is raised, persisting the flag so it is never said again (even across
+    /// restarts — quitting with the card up counts as having seen it) and
+    /// stopping recomputes. The card itself stays up for the session until
+    /// dismissed.
     pub fn mark_full_charge_advice_shown(&mut self) {
         if self.advice_shown {
             return;
@@ -1029,13 +1064,79 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_advice_state_file_counts_as_shown() {
-        // The once-ever guarantee must not silently reset on a crash: an
-        // existing but unreadable marker file means "already said".
+    fn raising_the_advice_persists_the_shown_state_even_if_the_app_quits() {
+        let dir = tagged_dir("advice-raise");
+        let path = dir.join("history.json");
+        let mut app = app_at(Some(path.clone()));
+        app.adaptive_advice = Some(unsaid_advice());
+        app.history_store.buckets = deep_discharge_buckets();
+        app.recompute_full_charge_advice();
+        assert!(
+            app.full_charge_advice.is_some(),
+            "detector fires before the quit"
+        );
+
+        // Quit right here — no dismissal. The once-ever contract is
+        // "shown at most one time ever", so the raise itself must have
+        // persisted the flag: a restart may not re-show the card.
+        assert!(app.advice_shown, "marked at raise, not at dismiss");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("advice-state.json")).unwrap(),
+            ADVICE_SHOWN_MARKER,
+            "once-ever flag persisted at raise"
+        );
+
+        app.save_history_now();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let restarted = App::with_history_path(rx, Some(path));
+        assert!(restarted.advice_shown, "flag survives the quit");
+        assert!(
+            restarted.full_charge_advice.is_none(),
+            "pattern still in the window, but the advice was said once ever"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_advice_state_is_quarantined_and_never_silent() {
+        // Deliberate semantics: an unreadable marker counts as said (the
+        // once-ever guarantee never resets on a crash), but never silently —
+        // the bytes are quarantined and a sticky notice says so, matching
+        // the M1/M2 history and daily-record discipline.
         let dir = tagged_dir("advice-corrupt");
         std::fs::write(dir.join("advice-state.json"), "{").unwrap();
-        let app = app_at(Some(dir.join("history.json")));
+        let mut app = app_at(Some(dir.join("history.json")));
         assert!(app.advice_shown, "corrupt marker counts as said");
+        let notice = app.advice_load_error.as_deref().expect("notice surfaced");
+        assert!(notice.contains("advice-state.json.corrupt"), "{notice}");
+        assert!(dir.join("advice-state.json.corrupt").exists());
+        assert!(!dir.join("advice-state.json").exists(), "moved aside");
+
+        // Even with the pattern live, the card stays hidden.
+        app.adaptive_advice = Some(unsaid_advice());
+        app.history_store.buckets = deep_discharge_buckets();
+        app.recompute_full_charge_advice();
+        assert!(
+            app.full_charge_advice.is_none(),
+            "said once ever, never re-shown"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unrecognized_marker_content_is_quarantined_too() {
+        // The marker match is exact: a well-formed-but-unrecognized file is
+        // corruption, not a "not said" vote, so it quarantines with a notice.
+        let dir = tagged_dir("advice-unrecognized");
+        std::fs::write(
+            dir.join("advice-state.json"),
+            "{\"adaptive_charging_advice_shown\":false}",
+        )
+        .unwrap();
+        let app = app_at(Some(dir.join("history.json")));
+        assert!(app.advice_shown);
+        assert!(app.advice_load_error.is_some(), "notice surfaced");
+        assert!(dir.join("advice-state.json.corrupt").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
