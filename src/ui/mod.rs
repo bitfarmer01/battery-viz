@@ -188,6 +188,13 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
+            // Sticky notice: the advice-state marker could not be read and
+            // was preserved as `advice-state.json.corrupt` (M2 — never
+            // silent). The advice stays hidden, deliberately.
+            if let Some(err) = &app.advice_load_error {
+                ui.separator();
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
+            }
             // FR-8: what the first-run import found. Absent when nothing
             // was imported — never a placeholder.
             if let Some(note) = &app.first_run_note {
