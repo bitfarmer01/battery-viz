@@ -10,6 +10,7 @@ use egui_plot::{Line, Plot, PlotPoints};
 use crate::app::App;
 use crate::benchmark::{grade, BenchmarkResult};
 use crate::capdetect::{CapPromptAnswer, CapStatus};
+use crate::caplevel::{CapAssessment, MIN_HISTORY_DAYS};
 use crate::collect::types::{state_of_health_pct, ChargingState};
 
 pub struct Dashboard {
@@ -479,6 +480,36 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
             ui.weak("Charge cap: likely none (behavioural) — the pack reached full on AC.");
         }
     }
+
+    // FR-2: the cap-level recommendation, only where the machine offers cap
+    // levels at all (degrade-or-hide; a level the machine cannot set is
+    // never suggested).
+    match app.cap_assessment() {
+        CapAssessment::Recommend(rec) => {
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 130),
+                format!(
+                    "💡 Cap level: {}% covers your usage — the lowest charge reached in {} days of history was {:.0}%.",
+                    rec.level_pct, rec.days, rec.lowest_pct
+                ),
+            );
+        }
+        CapAssessment::NeedHistory { days } => {
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "Cap level suggestion after {} more day(s) of history ({days} recorded).",
+                MIN_HISTORY_DAYS.saturating_sub(days)
+            ));
+        }
+        CapAssessment::NoFit { lowest_pct, days } => {
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "No cap level on this machine covers your usage (lowest charge {lowest_pct:.0}% over {days} days) — leave the cap at its highest.",
+            ));
+        }
+        CapAssessment::Unsupported => {}
+    }
 }
 
 fn fmt_opt(v: Option<f64>, suffix: &str) -> String {
@@ -511,6 +542,28 @@ fn draw_cap_setup_prompt(ctx: &egui::Context, app: &mut App) {
         );
         ui.add_space(2.0);
         ui.label(format!("On this machine: {} — {}", g.tool, g.steps));
+        // FR-2: the cap-level recommendation rides inside the setup prompt
+        // (spec: "Show the recommendation inside the FR-1 prompt"). With
+        // too little history yet, say when the level suggestion will be
+        // ready — advice, never a guess.
+        match app.cap_assessment() {
+            CapAssessment::Recommend(rec) => {
+                ui.add_space(2.0);
+                ui.label(format!(
+                    "From {} days of history: the lowest charge reached was {:.0}%. A cap at {}% still covers your usage — set that if it is offered.",
+                    rec.days, rec.lowest_pct, rec.level_pct
+                ));
+            }
+            CapAssessment::NeedHistory { .. } => {
+                ui.add_space(2.0);
+                ui.label(format!(
+                    "After {MIN_HISTORY_DAYS} days of history we can suggest the exact cap level your usage needs."
+                ));
+            }
+            // No cap levels on this machine, or none that cover the usage:
+            // the steps above stand alone.
+            CapAssessment::Unsupported | CapAssessment::NoFit { .. } => {}
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             match g.url {

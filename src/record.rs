@@ -40,7 +40,10 @@ pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
 pub const MAX_DAYS: usize = 10 * 366;
 
 /// On-disk schema version. A mismatch is treated as a corrupt file.
-const SCHEMA_VERSION: f64 = 1.0;
+/// Version 2 adds per-day state-of-charge tracking (`soc_n`, `soc_min`) for
+/// FR-2; version 1 rows (7 fields) still parse, with the SoC fields absent —
+/// those days contribute no minimum rather than a guessed one.
+const SCHEMA_VERSION: f64 = 2.0;
 
 /// One day's summary. Sums + counts per metric so a partially-populated
 /// day (missing temperature on Windows, say) never poisons the mean.
@@ -58,6 +61,12 @@ pub struct DailyRow {
     pub high_n: u32,
     /// Samples at or above `WARM_TEMP_C`.
     pub warm_n: u32,
+    /// Samples that carried a state of charge (FR-2: the quality gate for
+    /// the day's minimum — a day with too few readings contributes none).
+    pub soc_n: u32,
+    /// Lowest state of charge observed that day, percent. `None` when no
+    /// sample carried a state of charge.
+    pub soc_min: Option<f64>,
 }
 
 impl DailyRow {
@@ -70,6 +79,8 @@ impl DailyRow {
             cycles_last: None,
             high_n: 0,
             warm_n: 0,
+            soc_n: 0,
+            soc_min: None,
         }
     }
 
@@ -134,6 +145,14 @@ impl DailyRecord {
         };
         let row = &mut self.rows[idx];
         row.n += 1;
+        if let Some(v) = s.state_of_charge {
+            row.soc_n += 1;
+            // FR-2: the day's lowest charge. A one-sample sensor glitch
+            // would drag this down, and the cap-level recommendation errs
+            // high (a lower minimum means a higher covering cap) — the
+            // safe direction, at the cost of some savings.
+            row.soc_min = Some(row.soc_min.map_or(v, |m: f64| m.min(v)));
+        }
         if let Some(v) = state_of_health_pct(s) {
             row.soh_sum += v;
             row.soh_n += 1;
@@ -183,18 +202,19 @@ impl DailyRecord {
         added
     }
 
-    /// Serialize to the on-disk JSON schema:
-    /// `{"version":1,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n],...]}`
-    /// (cycles is NaN when unknown). Rust's f64 Display round-trips.
+    /// Serialize to the on-disk JSON schema (v2):
+    /// `{"version":2,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min],...]}`
+    /// (cycles and soc_min are NaN when unknown). Rust's f64 Display
+    /// round-trips.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(80 * self.rows.len() + 32);
-        out.push_str("{\"version\":1,\"rows\":[");
+        let mut out = String::with_capacity(90 * self.rows.len() + 32);
+        out.push_str("{\"version\":2,\"rows\":[");
         for (i, r) in self.rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
-                "[{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{}]",
                 r.day,
                 r.n,
                 r.soh_sum,
@@ -202,6 +222,8 @@ impl DailyRecord {
                 r.cycles_last.map(|c| c as f64).unwrap_or(f64::NAN),
                 r.high_n,
                 r.warm_n,
+                r.soc_n,
+                r.soc_min.unwrap_or(f64::NAN),
             ));
         }
         out.push_str("]}");
@@ -217,9 +239,11 @@ impl DailyRecord {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        if version != SCHEMA_VERSION {
+        if version != SCHEMA_VERSION && version != 1.0 {
             return Err(format!("unsupported schema version {version}"));
         }
+        // Version 1 rows carry 7 fields (no SoC tracking); version 2, 9.
+        let arity = if version == 1.0 { 7 } else { 9 };
         p.skip_ws();
         p.expect(b',')?;
         p.expect_key("rows")?;
@@ -233,13 +257,26 @@ impl DailyRecord {
             }
             p.expect(b'[')?;
             let f: Vec<f64> = p.number_list()?;
-            if f.len() != 7 {
-                return Err(format!("row arity {} != 7", f.len()));
+            if f.len() != arity {
+                return Err(format!("row arity {} != {arity}", f.len()));
             }
             let cycles = f[4];
             if !cycles.is_nan() && (cycles < 0.0 || cycles.fract() != 0.0) {
                 return Err(format!("invalid cycle count {cycles}"));
             }
+            let soc_min = if arity == 9 {
+                let v = f[8];
+                if v.is_nan() {
+                    None
+                } else if !(0.0..=100.0).contains(&v) {
+                    return Err(format!("invalid state of charge {v}"));
+                } else {
+                    Some(v)
+                }
+            } else {
+                // A v1 day observed no SoC tracking: no minimum, never a guess.
+                None
+            };
             rows.push(DailyRow {
                 day: f[0] as u32,
                 n: f[1] as u32,
@@ -252,6 +289,8 @@ impl DailyRecord {
                 },
                 high_n: f[5] as u32,
                 warm_n: f[6] as u32,
+                soc_n: if arity == 9 { f[7] as u32 } else { 0 },
+                soc_min,
             });
             p.skip_ws();
             if !p.eat(b',') {
@@ -330,6 +369,49 @@ mod tests {
             cycle_count: Some(120),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fold_tracks_the_days_lowest_charge() {
+        let mut rec = DailyRecord::default();
+        rec.fold(&sample(80.0, None), 3);
+        rec.fold(&sample(45.5, None), 3);
+        rec.fold(&sample(60.0, None), 3);
+        let r = rec.rows[0];
+        assert_eq!(r.soc_n, 3);
+        assert_eq!(r.soc_min, Some(45.5));
+        // A day with no state-of-charge readings has no minimum, never zero.
+        let mut rec = DailyRecord::default();
+        rec.fold(&BatterySample::default(), 3);
+        assert_eq!(rec.rows[0].soc_n, 0);
+        assert_eq!(rec.rows[0].soc_min, None);
+    }
+
+    #[test]
+    fn v1_record_parses_with_no_soc_minimum() {
+        // A file written by the pre-FR-2 schema: those days contribute no
+        // minimum rather than a guessed one.
+        let v1 = "{\"version\":1,\"rows\":[[3,2,180.0,2,120,1,0]]}";
+        let rec = DailyRecord::from_json(v1).expect("v1 parses");
+        assert_eq!(rec.rows.len(), 1);
+        assert_eq!(rec.rows[0].soc_n, 0);
+        assert_eq!(rec.rows[0].soc_min, None);
+        assert_eq!(rec.rows[0].high_n, 1);
+        // …and folding a new sample into that v1 day starts the minimum
+        // from the new sample alone (earlier lows are unknowable).
+        let mut rec = rec;
+        rec.fold(&sample(70.0, None), 3);
+        assert_eq!(rec.rows[0].soc_min, Some(70.0));
+    }
+
+    #[test]
+    fn v2_round_trip_preserves_the_soc_minimum() {
+        let mut rec = DailyRecord::default();
+        rec.fold(&sample(80.0, None), 3);
+        rec.fold(&sample(41.5, None), 3);
+        let round = DailyRecord::from_json(&rec.to_json()).expect("parse");
+        assert_eq!(round.rows[0].soc_min, Some(41.5));
+        assert_eq!(round.rows[0].soc_n, 2);
     }
 
     #[test]
