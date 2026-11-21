@@ -10,6 +10,11 @@
 //! - Quiet hours 22:00–08:00 local suppress everything (no critical alerts
 //!   exist); a suppressed fire is dropped, never queued, and consumes neither
 //!   cooldown nor daily cap.
+//! - FR-3: while a charge cap is detected (FR-1), the two charge coaches
+//!   (`DwellCoach`, `BandCoach`) are retired via
+//!   [`AlertEngine::set_charge_coaching_enabled`]; the heat alert is never
+//!   gated. Re-arming after the cap disappears resets the charge coaches,
+//!   so no stale window fires.
 //!
 //! The engine is a constant-memory `Copy`-free zone: `tick` allocates nothing
 //! (all state is plain integers, all messages are `&'static str`). Time is
@@ -189,6 +194,9 @@ pub struct AlertEngine {
     high_temp: HighTempState,
     dwell: DwellState,
     band: BandState,
+    /// FR-3: the charge coaches (DwellCoach, BandCoach) are retired while a
+    /// charge cap is active. Heat coaching is never gated.
+    charge_coaching_enabled: bool,
 }
 
 impl Default for AlertEngine {
@@ -213,6 +221,33 @@ impl AlertEngine {
                 daily: DailyCounter::default(),
             },
             band: BandState { latched: false, daily: DailyCounter::default() },
+            // Alerts are active until FR-1 detects a cap.
+            charge_coaching_enabled: true,
+        }
+    }
+
+    /// FR-3: retire (or re-arm) the charge coaches when a cap is detected
+    /// (or disappears). Idempotent — the app calls this every tick with the
+    /// current gate, and a repeated `true` must never disturb a coach
+    /// mid-sustain. The suppressed→active transition resets both charge
+    /// coaches so no stale sustain window or latch from the suppressed
+    /// period fires on re-enable; the heat alert keeps its state untouched.
+    pub fn set_charge_coaching_enabled(&mut self, enabled: bool) {
+        if self.charge_coaching_enabled == enabled {
+            return;
+        }
+        self.charge_coaching_enabled = enabled;
+        if enabled {
+            self.dwell = DwellState {
+                above_since: None,
+                latched: false,
+                last_fired: None,
+                daily: DailyCounter::default(),
+            };
+            self.band = BandState {
+                latched: false,
+                daily: DailyCounter::default(),
+            };
         }
     }
 
@@ -265,6 +300,10 @@ impl AlertEngine {
     }
 
     fn tick_dwell(&mut self, soc: Option<f64>, clock: ClockInput) -> Option<Alert> {
+        // FR-3: retired while a charge cap is active — nothing accumulates.
+        if !self.charge_coaching_enabled {
+            return None;
+        }
         let st = &mut self.dwell;
         st.daily.roll(clock.day);
 
@@ -298,6 +337,10 @@ impl AlertEngine {
     }
 
     fn tick_band(&mut self, sample: &BatterySample, clock: ClockInput) -> Option<Alert> {
+        // FR-3: retired while a charge cap is active — nothing accumulates.
+        if !self.charge_coaching_enabled {
+            return None;
+        }
         let st = &mut self.band;
         st.daily.roll(clock.day);
 
@@ -944,5 +987,104 @@ mod tests {
         assert_ne!(names[0], names[1]);
         assert_ne!(names[1], names[2]);
         assert_ne!(names[0], names[2]);
+    }
+
+    // ---- FR-3: charge-coaching retirement while a cap is on ----------------
+
+    /// The FR-3 gate retires DwellCoach and BandCoach; the heat alert on the
+    /// same engine keeps its full behavior.
+    #[test]
+    fn fr3_gate_retires_charge_coaches_but_not_heat() {
+        let mut e = AlertEngine::new();
+        e.set_charge_coaching_enabled(false);
+        // 24 h parked at 100 % on AC: neither charge coach may fire.
+        let parked = sample(None, Some(100.0), ChargingState::Charging);
+        let mut charge_fires = 0;
+        for i in 0..(24 * 3_600) {
+            if matches!(tick_at(&mut e, &parked, i as f64), Some(a) if a.kind != AlertKind::HighTemp)
+            {
+                charge_fires += 1;
+            }
+        }
+        assert_eq!(charge_fires, 0, "retired charge coaches must never fire");
+        // The heat alert on the same engine is untouched by the gate: a hot
+        // pack still fires after its usual 60 s sustain.
+        let hot = sample(Some(50.0), Some(100.0), ChargingState::Charging);
+        assert!(
+            tick_kind(&mut e, &hot, 0.0, AlertKind::HighTemp) || {
+                let mut fired = false;
+                for i in 1..=60 {
+                    fired |= tick_kind(&mut e, &hot, i as f64, AlertKind::HighTemp);
+                }
+                fired
+            },
+            "heat alert must be unchanged by the cap gate"
+        );
+    }
+
+    /// Re-arming after the cap disappears resets both charge coaches: no
+    /// stale sustain window from the suppressed period may fire at once.
+    #[test]
+    fn fr3_reenable_resets_stale_charge_windows() {
+        let mut e = AlertEngine::new();
+        let parked = sample(None, Some(100.0), ChargingState::Charging);
+        // Halfway through a qualifying dwell window, the cap is detected.
+        for i in 0..300 {
+            tick_at(&mut e, &parked, i as f64);
+        }
+        e.set_charge_coaching_enabled(false);
+        // Suppressed period (state frozen), then the cap disappears.
+        e.set_charge_coaching_enabled(true);
+        // Even though the old window was far past 10 min of clock, the
+        // re-armed coach needs a fresh sustain. (BandCoach does fire on
+        // this tick — its episode latch was reset too; that is correct.)
+        assert!(!tick_kind(&mut e, &parked, 10_000.0, AlertKind::DwellCoach));
+        for i in 1..600 {
+            assert!(
+                !tick_kind(&mut e, &parked, 10_000.0 + i as f64, AlertKind::DwellCoach),
+                "stale window fired on re-enable at +{i}"
+            );
+        }
+        assert!(
+            tick_kind(&mut e, &parked, 10_600.0, AlertKind::DwellCoach),
+            "a fresh 10-minute sustain fires the coach again"
+        );
+    }
+
+    /// The app re-applies the gate every tick. A repeated `true` must be a
+    /// no-op, never a reset of an in-progress window.
+    #[test]
+    fn fr3_repeated_enabled_calls_do_not_disturb_a_sustain() {
+        let mut e = AlertEngine::new();
+        let parked = sample(None, Some(100.0), ChargingState::Charging);
+        for i in 0..300 {
+            e.set_charge_coaching_enabled(true);
+            tick_at(&mut e, &parked, i as f64);
+        }
+        e.set_charge_coaching_enabled(true);
+        // The 5 minutes accumulated while the gate was re-applied still
+        // count toward the 10-minute sustain.
+        for i in 300..600 {
+            assert!(
+                !tick_kind(&mut e, &parked, i as f64, AlertKind::DwellCoach),
+                "fired early at +{i}"
+            );
+        }
+        assert!(
+            tick_kind(&mut e, &parked, 600.0, AlertKind::DwellCoach),
+            "idempotent gate re-apply must not reset the window"
+        );
+    }
+
+    /// The fresh-engine default is charge coaching ON: alerts are active
+    /// until FR-1 detects a cap.
+    #[test]
+    fn fr3_fresh_engine_has_charge_coaching_enabled() {
+        let mut e = AlertEngine::new();
+        let s = sample(None, Some(90.0), ChargingState::Charging);
+        assert!(
+            tick_at(&mut e, &s, 1.0).is_some(),
+            "no-cap machines keep their nudge"
+        );
     }
 }
