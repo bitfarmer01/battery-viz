@@ -14,8 +14,8 @@ use crate::clock;
 use crate::collect::CollectorResult;
 use crate::history::HistoryStore;
 use crate::notify;
-use crate::warm::{self, WarmHoursReport};
 use crate::record::DailyRecord;
+use crate::warm::{self, WarmHoursReport};
 
 /// How many samples of history the dashboard keeps (at 1 Hz, 10 minutes).
 pub const HISTORY_LEN: usize = 600;
@@ -59,11 +59,18 @@ pub struct App {
     record_path: Option<PathBuf>,
     /// Sticky dashboard notice: the persisted record could not be read.
     pub record_load_error: Option<String>,
-    /// First-run capacity seed, still running in the background (Windows:
-    /// powercfg /batteryreport). `None` when there is nothing to wait for —
-    /// record not empty, no data dir, or the seed already applied.
-    pending_record_seed:
-        Option<(std::sync::mpsc::Receiver<Vec<crate::caps::SeedCapacity>>, PathBuf)>,
+    /// First-run import (FR-8), still running in the background: the
+    /// capacity rows (Windows: `powercfg /batteryreport`) plus, when the
+    /// machine holds one, the battery's own lifetime record (macOS: the
+    /// ioreg `LifetimeData` counters) — both through the capability
+    /// adapter. `None` when there is nothing to wait for — record not
+    /// empty (not a first run), no data dir, or the import already
+    /// applied.
+    pending_record_seed: Option<(std::sync::mpsc::Receiver<crate::first_run::Import>, PathBuf)>,
+    /// FR-8: the day-one note from the first-run import (what the machine
+    /// already held), shown in the header for the session. `None` when
+    /// nothing was imported — never a placeholder, never an error.
+    pub first_run_note: Option<String>,
     /// New minute-buckets folded in since the last on-disk checkpoint (M1).
     buckets_since_save: u32,
     /// Monotonic time of the last dwell-accumulated sample (audit H4);
@@ -192,9 +199,10 @@ impl App {
                     )
                 });
                 let record = record_load.record;
-                // First run: seed from capacity history the machine already
-                // holds, asked through the capability adapter (Windows:
-                // powercfg /batteryreport). The Windows answer needs a
+                // First run: import the long-term record the machine
+                // already holds, asked through the capability adapter
+                // (Windows: powercfg /batteryreport; macOS: the ioreg
+                // LifetimeData counters). The Windows answer needs a
                 // subprocess that can take seconds, so it runs on a
                 // background thread and is applied whenever it lands
                 // (`poll_record_seed` on a later frame) — window creation
@@ -205,7 +213,11 @@ impl App {
                     let record_path = record_path.clone();
                     let (tx, rx) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
-                        let _ = tx.send(crate::caps::platform_capabilities().capacity_seed());
+                        let caps = crate::caps::platform_capabilities();
+                        let _ = tx.send(crate::first_run::Import {
+                            seeds: caps.capacity_seed(),
+                            lifetime: caps.lifetime_record(),
+                        });
                     });
                     Some((rx, record_path))
                 } else {
@@ -255,6 +267,7 @@ impl App {
             record_path,
             record_load_error,
             pending_record_seed,
+            first_run_note: None,
             buckets_since_save: 0,
             dwell_prev_s: None,
             last_error: None,
@@ -288,19 +301,23 @@ impl App {
             return;
         };
         match rx.try_recv() {
-            Ok(seeds) => {
+            Ok(import) => {
                 let record_path = record_path.clone();
                 self.pending_record_seed = None;
                 // Real samples may have folded in while the report ran;
                 // seed() fills only days with no row, so nothing sampled
                 // is overwritten either way.
-                if !seeds.is_empty() {
-                    self.daily_record.seed(&seeds);
+                if !import.seeds.is_empty() {
+                    self.daily_record.seed(&import.seeds);
                     if let Err(e) = self.daily_record.save(&record_path) {
                         self.record_load_error =
                             Some(format!("seeded daily record could not be saved ({e})"));
                     }
                 }
+                // FR-8: the day-one note from whatever the machine already
+                // held. Nothing imported — no note, no error, no placeholder.
+                self.first_run_note =
+                    crate::first_run::first_run_note(&self.daily_record, import.lifetime);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {

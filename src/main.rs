@@ -14,6 +14,7 @@ mod caps;
 mod clock;
 mod collect;
 mod dwell;
+mod first_run;
 mod history;
 mod notify;
 mod record;

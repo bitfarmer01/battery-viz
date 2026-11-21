@@ -188,6 +188,12 @@ fn draw(ctx: &egui::Context, app: &mut App, export_status: &mut Option<String>) 
                 ui.separator();
                 ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("⚠ {err}"));
             }
+            // FR-8: what the first-run import found. Absent when nothing
+            // was imported — never a placeholder.
+            if let Some(note) = &app.first_run_note {
+                ui.separator();
+                ui.weak(note);
+            }
             ui.separator();
             let pause_label = if app.alerts_paused {
                 "▶ Resume alerts"

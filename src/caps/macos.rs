@@ -3,9 +3,12 @@
 //! Optimized Battery Charging state (roadmap FR-1/FR-5), so both settings
 //! answer BehavioralOnly and FR-1's behavioural detection is the fallback.
 
+use std::io::Cursor;
+use std::process::Command;
+
 use super::{
-    CapOptions, CapRange, Capabilities, Detectability, Maker, MetricId, Platform, SettingGuidance,
-    SettingKind,
+    CapOptions, CapRange, Capabilities, Detectability, LifetimeRecord, Maker, MetricId, Platform,
+    SettingGuidance, SettingKind,
 };
 use crate::collect::macos::MacCollector;
 use crate::collect::{Collector, SourceKind};
@@ -81,6 +84,72 @@ impl Capabilities for MacCapabilities {
             }),
         }
     }
+
+    fn lifetime_record(&self) -> Option<LifetimeRecord> {
+        // The lifetime counters sit in `LifetimeData` under the battery
+        // entry — but on macOS 27 the block moved to the child pack entry,
+        // so both places are asked and the first readable one wins.
+        let battery = ioreg_battery_dict("AppleSmartBattery");
+        let pack = ioreg_battery_dict("AppleSmartBatteryPack");
+        for dict in [battery, pack].into_iter().flatten() {
+            if let Some(record) = parse_lifetime_record(&dict) {
+                return Some(record);
+            }
+        }
+        // Absent on some models and versions, unreadable on others: no
+        // record, no error — the import simply does not happen.
+        None
+    }
+}
+
+/// Run ioreg for one battery entry and return its property dictionary.
+/// Any failure — spawn, exit status, empty output, plist parse, wrong
+/// shape — is `None`; the lifetime record is optional end to end.
+fn ioreg_battery_dict(name: &str) -> Option<plist::Dictionary> {
+    let out = Command::new("ioreg")
+        .args(["-r", "-n", name, "-d", "1", "-a", "-x"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = plist::Value::from_reader(Cursor::new(&out.stdout)).ok()?;
+    // `ioreg -r -d 1` emits an array of dicts (or a single dict on some
+    // versions) — the same shape the collector's parser handles.
+    let dict = value
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(value);
+    dict.as_dictionary().cloned()
+}
+
+/// The inferred `LifetimeData` layout, validated strictly.
+///
+/// Only `TotalOperatingTime` is exported, because it is the only figure
+/// whose semantics survive scrutiny: it is lifetime hours, and it is a
+/// calendar-speed clock (it rises in sleep and with the lid shut), so it
+/// reads as pack age, never time-in-use — measured so on macOS 14.2.1
+/// through 27.2. The `TimeAtHighSoc` blob beside it (28 little-endian
+/// u32 counters on the machines that expose it, absent on all macOS 27
+/// machines measured) deliberately stays unread: which counter holds
+/// which charge band is not established anywhere, and an interpretation
+/// exported as data would be exactly the guess the roadmap forbids.
+///
+/// Anything else — key missing, wrong type, negative, beyond a sanity
+/// bound — fails silently: `None`, no import, no error (FR-8 acceptance).
+fn parse_lifetime_record(dict: &plist::Dictionary) -> Option<LifetimeRecord> {
+    let lifetime = dict.get("LifetimeData")?.as_dictionary()?;
+    let hours = lifetime.get("TotalOperatingTime")?.as_signed_integer()?;
+    let hours_f = hours as f64;
+    // Sanity bound: a pack cannot have outlived 23 years of continuous
+    // operation; a figure past 200 000 h is a misparse, not a reading.
+    if !(hours_f > 0.0 && hours_f < 200_000.0) {
+        return None;
+    }
+    Some(LifetimeRecord {
+        operating_hours: hours_f,
+    })
 }
 
 impl Collector for MacCapabilities {
