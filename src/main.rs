@@ -11,6 +11,7 @@ mod alert;
 mod app;
 mod benchmark;
 mod capdetect;
+mod caplevel;
 mod caps;
 mod clock;
 mod collect;

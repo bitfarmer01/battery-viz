@@ -634,6 +634,14 @@ impl App {
         self.capabilities.guidance(SettingKind::ChargeCap)
     }
 
+    /// FR-2: the cap-level recommendation for this machine, from the daily
+    /// record (feature logic) and the FR-0 adapter (which cap levels exist).
+    /// Recomputed on demand — a scan of at most `MAX_DAYS` rows, cheap even
+    /// at 1 Hz — so there is no cached state to go stale.
+    pub fn cap_assessment(&self) -> crate::caplevel::CapAssessment {
+        crate::caplevel::assess(&self.daily_record, &self.capabilities.cap_options())
+    }
+
     /// FR-1: record the user's answer; the prompt never shows again. The
     /// answer is persisted BEFORE it is committed to memory: a failed persist
     /// leaves the prompt on screen (the error surfaces in the header) rather
@@ -875,6 +883,35 @@ mod tests {
         let mut app = app_at(path);
         app.temperature_available = false;
         app
+    }
+
+    #[test]
+    fn cap_level_recommendation_wires_record_and_adapter_together() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, None);
+        // Fresh install: below the 7-day gate, nothing is recommended.
+        assert_eq!(
+            app.cap_assessment(),
+            crate::caplevel::CapAssessment::NeedHistory { days: 0 }
+        );
+        // Seven normal days dipping to 62%: the adapter's lowest covering
+        // level (sim/macOS grid 80–100 step 5 → 80) is recommended.
+        for day in 0..7u32 {
+            let mut s = sample(62.0);
+            app.daily_record.fold(&s, day);
+            s.state_of_charge = Some(100.0);
+            for _ in 0..crate::caplevel::MIN_DAY_SAMPLES {
+                app.daily_record.fold(&s, day);
+            }
+        }
+        assert_eq!(
+            app.cap_assessment(),
+            crate::caplevel::CapAssessment::Recommend(crate::caplevel::CapRecommendation {
+                level_pct: 80,
+                lowest_pct: 62.0,
+                days: 7
+            })
+        );
     }
 
     fn sample(soc: f64) -> crate::collect::BatterySample {
