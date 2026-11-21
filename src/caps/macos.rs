@@ -141,13 +141,14 @@ fn ioreg_battery_dict(name: &str) -> Option<plist::Dictionary> {
 fn parse_lifetime_record(dict: &plist::Dictionary) -> Option<LifetimeRecord> {
     let lifetime = dict.get("LifetimeData")?.as_dictionary()?;
     let hours = lifetime.get("TotalOperatingTime")?.as_signed_integer()?;
+    let hours_f = hours as f64;
     // Sanity bound: a pack cannot have outlived 23 years of continuous
     // operation; a figure past 200 000 h is a misparse, not a reading.
-    if !(0.0 < hours as f64 && (hours as f64) < 200_000.0) {
+    if !(hours_f > 0.0 && hours_f < 200_000.0) {
         return None;
     }
     Some(LifetimeRecord {
-        operating_hours: hours as f64,
+        operating_hours: hours_f,
     })
 }
 

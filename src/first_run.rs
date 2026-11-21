@@ -57,9 +57,13 @@ pub fn first_run_note(record: &DailyRecord, lifetime: Option<LifetimeRecord>) ->
 /// trend, and a one-row import is reported as nothing rather than as a
 /// "trend" from a point to itself.
 fn fade_clause(record: &DailyRecord) -> Option<String> {
+    // Seed-only rows (`n == 0`): live 1 Hz samples can fold into today's
+    // row while the import runs, and their readings are not battery-report
+    // data — attributing them to the report would overclaim provenance.
     let with_soh: Vec<(u32, f64)> = record
         .rows
         .iter()
+        .filter(|r| r.n == 0)
         .filter_map(|r| r.soh_mean().map(|s| (r.day, s)))
         .collect();
     let (first_day, first_soh) = *with_soh.first()?;
