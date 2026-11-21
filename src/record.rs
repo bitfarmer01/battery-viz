@@ -76,7 +76,6 @@ impl DailyRow {
     /// Mean state-of-health capacity recorded that day. Consumed from
     /// FR-8 (import) onward; stored now so the record is complete from
     /// day one.
-    #[allow(dead_code)]
     pub fn soh_mean(&self) -> Option<f64> {
         if self.soh_n == 0 {
             None

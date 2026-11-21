@@ -177,6 +177,23 @@ pub struct SeedCapacity {
     pub soh_pct: f64,
 }
 
+/// The battery's own lifetime record, as far as an adapter can read it
+/// with corroborated semantics (FR-8 first-run import).
+///
+/// The macOS source field is undocumented; the one figure exported here —
+/// lifetime operating hours — is the only one whose semantics survive
+/// scrutiny (it is a calendar-speed clock: it rises in sleep, so it is
+/// pack age, never time-in-use; corroborated by measurement on macOS
+/// 14.2.1–27.2). Everything else the record holds — notably the
+/// `TimeAtHighSoc` blob, whose per-counter charge-band meaning is not
+/// established — is deliberately left unread: exporting an
+/// interpretation would be a guess, which the roadmap forbids.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LifetimeRecord {
+    /// Lifetime operating hours, from the battery's own clock.
+    pub operating_hours: f64,
+}
+
 /// One platform adapter: readable metrics, detectable settings, guidance.
 pub trait Capabilities: Send {
     fn platform(&self) -> Platform;
@@ -195,6 +212,15 @@ pub trait Capabilities: Send {
     /// source of prior history offers none, and nothing is invented.
     fn capacity_seed(&self) -> Vec<SeedCapacity> {
         Vec::new()
+    }
+    /// The lifetime record this machine's battery already holds (FR-8
+    /// first-run import), or `None` when it cannot be read without
+    /// guessing. The macOS source is undocumented and its layout is
+    /// inferred, so adapters export only figures with corroborated
+    /// semantics and fail silently on any deviation: a parse failure is
+    /// no record, never an error. Default: unavailable.
+    fn lifetime_record(&self) -> Option<LifetimeRecord> {
+        None
     }
 }
 
