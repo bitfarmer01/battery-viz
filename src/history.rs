@@ -185,7 +185,8 @@ pub struct HistoryStore {
     /// suspected, the retention cutoff does not fire (`MAX_BUCKETS` still
     /// bounds growth), so one glitched clock reading cannot wipe the stored
     /// week in a single step; two consecutive advancing samples confirm the
-    /// era and retention resumes. A correction back clears it at once.
+    /// era and retention resumes. A correction back clears it at once and
+    /// resumes real minute buckets (review MEDIUM recovery).
     pending_era_minute: Option<u64>,
     /// Consecutive samples that have advanced normally inside the suspected
     /// era (see `pending_era_minute`).
@@ -232,8 +233,27 @@ impl HistoryStore {
                     // out-of-order bucket per minute would overflow
                     // MAX_BUCKETS and evict the real week from the front.
                     // Fold the sample into the newest bucket instead —
-                    // still counted, nothing destroyed.
-                    if let Some(b) = self.buckets.last_mut() {
+                    // still counted, nothing destroyed. Recovery (review
+                    // MEDIUM): if the newest bucket is the unconfirmed
+                    // far-future era bucket, the clock has corrected back
+                    // to the real present. Re-anchor that bucket to the
+                    // correction minute — its samples were collected
+                    // during the unconfirmed glitch, so the correction is
+                    // the only truthful shared label they can carry — and
+                    // resume normal minute buckets at once, instead of
+                    // piling the live stream onto a glitch-labeled bucket
+                    // until the clock would catch up with it.
+                    let in_suspect_era =
+                        matches!(self.pending_era_minute, Some(pending) if minute < pending);
+                    if in_suspect_era {
+                        self.pending_era_minute = None;
+                        self.era_witnesses = 0;
+                        let mut b = self.buckets.pop().expect("suspect bucket is the newest");
+                        b.minute = minute;
+                        b.add(s);
+                        self.buckets.insert(idx, b);
+                        created = true;
+                    } else if let Some(b) = self.buckets.last_mut() {
                         b.add(s);
                     }
                 } else {
@@ -883,20 +903,65 @@ mod tests {
         assert_eq!(store.buckets.len(), before + 1);
         assert_eq!(store.buckets.first().unwrap().minute, 10_000);
 
-        // A correction back to the real clock clears the suspicion at
-        // once: retention is trusted again, and the (still-recent) real
-        // history all sits inside the window — nothing was lost.
+        // A correction back to the real clock clears the suspicion at once
+        // and re-anchors the suspect bucket to the present (review MEDIUM):
+        // the live stream must not fold into the glitch-labeled bucket for
+        // as long as the clock would take to catch up with it.
         store.push(&sample(50.0, Some(30.0)), 10_121 * 60);
+        assert_eq!(store.buckets.last().unwrap().minute, 10_121);
         assert_eq!(store.buckets.len(), before + 1);
-        assert_eq!(store.buckets.first().unwrap().minute, 10_000);
+        // The glitch-span sample stays counted — re-anchored, with the
+        // correcting sample folded in beside it.
+        let reanchored = store.buckets.last().unwrap();
+        assert_eq!(reanchored.n, 2);
+        assert_eq!(reanchored.minute, 10_121);
 
-        // But a real era — two advancing samples — confirms it, and the
-        // pre-jump buckets then age out exactly as the retention rule
+        // A second far-forward jump gets the same collapse + corroboration
+        // treatment: two advancing samples confirm the new era, and the
+        // pre-jump week then ages out exactly as the retention rule
         // dictates, not one bucket sooner.
         store.push(&sample(50.0, Some(30.0)), (jump_minute + 1) * 60);
         store.push(&sample(50.0, Some(30.0)), (jump_minute + 2) * 60);
-        assert_eq!(store.buckets.last().unwrap().minute, jump_minute + 2);
+        assert_eq!(store.buckets.first().unwrap().minute, 10_000);
+        store.push(&sample(50.0, Some(30.0)), (jump_minute + 3) * 60);
+        assert_eq!(store.buckets.last().unwrap().minute, jump_minute + 3);
         assert!(store.buckets.first().unwrap().minute > 10_000 + 119);
+    }
+
+    #[test]
+    fn a_correction_back_out_of_a_suspected_era_resumes_real_buckets() {
+        // Review MEDIUM: after a far-forward glitch corrects back, the
+        // real stream must get fresh minute buckets at once — not fold
+        // into the glitch-labeled bucket until the real clock catches up
+        // with it (weeks for a month-sized jump).
+        let mut store = HistoryStore::default();
+        for m in 0..120 {
+            store.push(&sample(50.0, Some(30.0)), (10_000 + m) * 60);
+        }
+        let jump_minute = 10_120 + 30 * 24 * 60;
+        store.push(&sample(50.0, Some(30.0)), jump_minute * 60); // glitch
+        store.push(&sample(50.0, Some(30.0)), 10_121 * 60); // corrected back
+        store.push(&sample(50.0, Some(30.0)), 10_122 * 60);
+        store.push(&sample(50.0, Some(30.0)), 10_123 * 60);
+        // Real minutes form real buckets again...
+        let newest: Vec<u64> = store
+            .buckets
+            .iter()
+            .map(|b| b.minute)
+            .rev()
+            .take(3)
+            .collect();
+        assert_eq!(newest, vec![10_123, 10_122, 10_121]);
+        // ...the suspect bucket was re-anchored to the correction minute
+        // with its glitch-span sample still counted beside the correcting
+        // sample, and no bucket remains at the fictional minute.
+        assert!(store.buckets.iter().all(|b| b.minute < 20_000));
+        let reanchored = store
+            .buckets
+            .iter()
+            .find(|b| b.minute == 10_121)
+            .expect("re-anchored bucket present");
+        assert_eq!(reanchored.n, 2);
     }
 
     #[test]
