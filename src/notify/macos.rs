@@ -58,6 +58,15 @@ impl MacosTray {
         })
     }
 
+    /// Re-assert the app's pause state on the tray checkbox (re-audit
+    /// Low 5): the header button and this checkbox are two controls over
+    /// one state, and `app.alerts_paused` is its single source of truth.
+    /// Called every frame so the checkbox follows the header button (and
+    /// any other writer) instead of holding its own opinion.
+    pub fn sync_pause_checked(&self, paused: bool) {
+        self.pause_item.set_checked(paused);
+    }
+
     /// Drain ALL pending menu events — clicks that arrive within one wake
     /// (up to 1 s in hidden mode) are queued, not collapsed.
     pub fn poll(&self) -> Vec<TrayCommand> {

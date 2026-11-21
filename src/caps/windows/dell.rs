@@ -11,7 +11,10 @@ pub fn module() -> MakerModule {
         maker: Maker::Dell,
         cap_options: CapOptions {
             fixed: &[],
-            // Dell Power Manager custom charging spans 50–100%.
+            // Dell Power Manager custom charging spans 50–100%. The exact
+            // slider bounds vary by model/tool version and are NOT verified
+            // against vendor documentation — needs confirmation on real
+            // hardware before this range is treated as authoritative.
             range: Some(CapRange {
                 min: 50,
                 max: 100,
@@ -22,8 +25,9 @@ pub fn module() -> MakerModule {
         cap_guidance: Some(SettingGuidance {
             tool: "Dell Power Manager",
             steps: "Open Dell Power Manager → Battery Information → Charging configuration and \
-                    set a charge limit; on business machines, set Battery Health Manager in the \
-                    BIOS (F10 at boot) instead",
+                    set a charge limit; on business machines, set Battery Charge Configuration \
+                    in the BIOS instead (F2 at the Dell logo enters Setup, under Power / \
+                    Primary Battery Charge Configuration; F10 only saves and exits)",
             url: None,
         }),
         adaptive_guidance: None,
