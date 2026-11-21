@@ -90,25 +90,49 @@ impl AlertKind {
         }
     }
 
+    /// Maximum real-time fires per local day — the engine's daily cap.
+    /// Exposed so the FR-6 outcome store can re-apply the same caps to
+    /// persisted gate state across a restart (re-audit N4a).
+    pub fn daily_cap(self) -> u32 {
+        match self {
+            AlertKind::HighTemp => HIGH_TEMP_MAX_PER_DAY,
+            AlertKind::DwellCoach => DWELL_MAX_PER_DAY,
+            AlertKind::BandCoach => BAND_MAX_PER_DAY,
+        }
+    }
+
+    /// Minimum spacing between two fires, in seconds (0 = the daily cap is
+    /// the only limiter, as for BandCoach). Same exposure rationale as
+    /// [`AlertKind::daily_cap`].
+    pub fn cooldown_secs(self) -> u64 {
+        match self {
+            AlertKind::HighTemp => HIGH_TEMP_COOLDOWN_S as u64,
+            AlertKind::DwellCoach => DWELL_COOLDOWN_S as u64,
+            AlertKind::BandCoach => 0,
+        }
+    }
+
+    /// Re-audit N4c: heat is a physical condition, not a habit — the heat
+    /// alert is capped by its cooldown and daily limit only and must never
+    /// be retired for repeated ignores; the charge coaches can retire.
+    pub fn retirable(self) -> bool {
+        !matches!(self, AlertKind::HighTemp)
+    }
+
     /// Pure predicate (FR-6): has the condition this alert coaches on
     /// ended? One definition per kind, right next to the thresholds that
     /// define the condition. Missing telemetry is unknown, never ended.
     pub fn condition_ended(self, s: &BatterySample) -> bool {
         match self {
             // The heat alert resolves on the same hysteresis it fires with.
-            AlertKind::HighTemp => {
-                s.temperature_c.is_some_and(|t| t < HIGH_TEMP_RESUME_C)
-            }
+            AlertKind::HighTemp => s.temperature_c.is_some_and(|t| t < HIGH_TEMP_RESUME_C),
             // The dwell alert acted on = the pack left the high-charge zone.
-            AlertKind::DwellCoach => s
-                .state_of_charge
-                .is_some_and(|c| c < DWELL_TRIGGER_SOC_PCT),
+            AlertKind::DwellCoach => s.state_of_charge.is_some_and(|c| c < DWELL_TRIGGER_SOC_PCT),
             // The band alert acted on = unplugged, or a known state of
             // charge below the band. A plugged-in sample with unknown SOC
             // is unknown, not ended.
             AlertKind::BandCoach => {
-                !is_plugged(s)
-                    || s.state_of_charge.is_some_and(|c| c < BAND_SOC_PCT)
+                !is_plugged(s) || s.state_of_charge.is_some_and(|c| c < BAND_SOC_PCT)
             }
         }
     }
@@ -137,7 +161,10 @@ impl Alert {
     }
 
     fn of(kind: AlertKind) -> Self {
-        Alert { kind, message: Self::message(kind) }
+        Alert {
+            kind,
+            message: Self::message(kind),
+        }
     }
 }
 
@@ -220,7 +247,10 @@ impl AlertEngine {
                 last_fired: None,
                 daily: DailyCounter::default(),
             },
-            band: BandState { latched: false, daily: DailyCounter::default() },
+            band: BandState {
+                latched: false,
+                daily: DailyCounter::default(),
+            },
             // Alerts are active until FR-1 detects a cap.
             charge_coaching_enabled: true,
         }
@@ -259,11 +289,7 @@ impl AlertEngine {
             .or_else(|| self.tick_band(sample, clock))
     }
 
-    fn tick_high_temp(
-        &mut self,
-        temp_c: Option<f64>,
-        clock: ClockInput,
-    ) -> Option<Alert> {
+    fn tick_high_temp(&mut self, temp_c: Option<f64>, clock: ClockInput) -> Option<Alert> {
         let st = &mut self.high_temp;
         st.daily.roll(clock.day);
 
@@ -281,8 +307,9 @@ impl AlertEngine {
             st.active = false;
         }
 
-        let sustained =
-            st.above_since.is_some_and(|since| clock.now_s - since >= HIGH_TEMP_SUSTAIN_S);
+        let sustained = st
+            .above_since
+            .is_some_and(|since| clock.now_s - since >= HIGH_TEMP_SUSTAIN_S);
         let cooled_down = st
             .last_fired
             .is_none_or(|t| clock.now_s - t >= HIGH_TEMP_COOLDOWN_S);
@@ -318,8 +345,9 @@ impl AlertEngine {
             }
         }
 
-        let sustained =
-            st.above_since.is_some_and(|since| clock.now_s - since >= DWELL_SUSTAIN_S);
+        let sustained = st
+            .above_since
+            .is_some_and(|since| clock.now_s - since >= DWELL_SUSTAIN_S);
         let cooled_down = st
             .last_fired
             .is_none_or(|t| clock.now_s - t >= DWELL_COOLDOWN_S);
@@ -344,8 +372,8 @@ impl AlertEngine {
         let st = &mut self.band;
         st.daily.roll(clock.day);
 
-        let in_band = is_plugged(sample)
-            && sample.state_of_charge.is_some_and(|s| s >= BAND_SOC_PCT);
+        let in_band =
+            is_plugged(sample) && sample.state_of_charge.is_some_and(|s| s >= BAND_SOC_PCT);
         if !in_band {
             st.latched = false;
             return None;
@@ -386,9 +414,7 @@ fn is_plugged(sample: &BatterySample) -> bool {
 /// separate tolerance is needed.
 fn is_detected_cap(sample: &BatterySample) -> bool {
     sample.charging_state == Some(ChargingState::OnAcNotCharging)
-        && sample
-            .state_of_charge
-            .is_some_and(|s| s >= BAND_SOC_PCT)
+        && sample.state_of_charge.is_some_and(|s| s >= BAND_SOC_PCT)
 }
 
 #[cfg(test)]
@@ -401,7 +427,11 @@ mod tests {
     const NOON_HOUR: u8 = 10;
 
     fn clock(now_s: f64) -> ClockInput {
-        ClockInput { now_s, hour: NOON_HOUR, day: DAY }
+        ClockInput {
+            now_s,
+            hour: NOON_HOUR,
+            day: DAY,
+        }
     }
 
     fn sample(temp_c: Option<f64>, soc: Option<f64>, state: ChargingState) -> BatterySample {
@@ -482,10 +512,30 @@ mod tests {
         // window resets on every cool tick, so it never reaches 60 s.
         for cycle in 0..40 {
             let base = (cycle * 4) as f64;
-            assert!(tick_at(&mut e, &sample(Some(47.0), None, ChargingState::Discharging), base).is_none());
-            assert!(tick_at(&mut e, &sample(Some(30.0), None, ChargingState::Discharging), base + 1.0).is_none());
-            assert!(tick_at(&mut e, &sample(Some(47.0), None, ChargingState::Discharging), base + 2.0).is_none());
-            assert!(tick_at(&mut e, &sample(Some(30.0), None, ChargingState::Discharging), base + 3.0).is_none());
+            assert!(tick_at(
+                &mut e,
+                &sample(Some(47.0), None, ChargingState::Discharging),
+                base
+            )
+            .is_none());
+            assert!(tick_at(
+                &mut e,
+                &sample(Some(30.0), None, ChargingState::Discharging),
+                base + 1.0
+            )
+            .is_none());
+            assert!(tick_at(
+                &mut e,
+                &sample(Some(47.0), None, ChargingState::Discharging),
+                base + 2.0
+            )
+            .is_none());
+            assert!(tick_at(
+                &mut e,
+                &sample(Some(30.0), None, ChargingState::Discharging),
+                base + 3.0
+            )
+            .is_none());
         }
     }
 
@@ -538,8 +588,15 @@ mod tests {
             now += 1.0;
         }
         let at = fired_second.expect("no second fire after resolve + cooldown");
-        assert_eq!(at, 1_061.0, "must fire at 60 s of new sustain (restarts at t=1001)");
-        assert_eq!(run_kind(&mut e, &hot, 1_200.0, AlertKind::HighTemp), 0, "latched after refire");
+        assert_eq!(
+            at, 1_061.0,
+            "must fire at 60 s of new sustain (restarts at t=1001)"
+        );
+        assert_eq!(
+            run_kind(&mut e, &hot, 1_200.0, AlertKind::HighTemp),
+            0,
+            "latched after refire"
+        );
     }
 
     #[test]
@@ -585,11 +642,22 @@ mod tests {
         }
         assert_eq!(fired_today, 3);
         // Next day: the cap is fresh and a fire goes out again.
-        let next_day = ClockInput { now_s: 90_000.0, hour: NOON_HOUR, day: DAY + 1 };
-        assert!(e.tick(&hot, next_day).is_none(), "sustain window must restart");
+        let next_day = ClockInput {
+            now_s: 90_000.0,
+            hour: NOON_HOUR,
+            day: DAY + 1,
+        };
+        assert!(
+            e.tick(&hot, next_day).is_none(),
+            "sustain window must restart"
+        );
         let mut fired_next_day = 0;
         for i in 0..61 {
-            let c = ClockInput { now_s: 90_000.0 + i as f64, hour: NOON_HOUR, day: DAY + 1 };
+            let c = ClockInput {
+                now_s: 90_000.0 + i as f64,
+                hour: NOON_HOUR,
+                day: DAY + 1,
+            };
             if e.tick(&hot, c).is_some() {
                 fired_next_day += 1;
             }
@@ -604,7 +672,11 @@ mod tests {
         // 23:00, sustained past the window: suppressed.
         let mut fired_quiet = 0;
         for i in 0..120 {
-            let c = ClockInput { now_s: i as f64, hour: 23, day: DAY };
+            let c = ClockInput {
+                now_s: i as f64,
+                hour: 23,
+                day: DAY,
+            };
             if e.tick(&hot, c).is_some() {
                 fired_quiet += 1;
             }
@@ -614,7 +686,11 @@ mod tests {
         // neither the cap nor the cooldown.
         let mut fired_morning = 0;
         for i in 120..200 {
-            let c = ClockInput { now_s: i as f64, hour: 8, day: DAY };
+            let c = ClockInput {
+                now_s: i as f64,
+                hour: 8,
+                day: DAY,
+            };
             if e.tick(&hot, c).is_some() {
                 fired_morning += 1;
             }
@@ -624,12 +700,42 @@ mod tests {
 
     #[test]
     fn quiet_hours_boundary_22_and_8() {
-        assert!(ClockInput { now_s: 0.0, hour: 22, day: DAY }.is_quiet_hours());
-        assert!(ClockInput { now_s: 0.0, hour: 23, day: DAY }.is_quiet_hours());
-        assert!(ClockInput { now_s: 0.0, hour: 0, day: DAY }.is_quiet_hours());
-        assert!(ClockInput { now_s: 0.0, hour: 7, day: DAY }.is_quiet_hours());
-        assert!(!ClockInput { now_s: 0.0, hour: 8, day: DAY }.is_quiet_hours());
-        assert!(!ClockInput { now_s: 0.0, hour: 21, day: DAY }.is_quiet_hours());
+        assert!(ClockInput {
+            now_s: 0.0,
+            hour: 22,
+            day: DAY
+        }
+        .is_quiet_hours());
+        assert!(ClockInput {
+            now_s: 0.0,
+            hour: 23,
+            day: DAY
+        }
+        .is_quiet_hours());
+        assert!(ClockInput {
+            now_s: 0.0,
+            hour: 0,
+            day: DAY
+        }
+        .is_quiet_hours());
+        assert!(ClockInput {
+            now_s: 0.0,
+            hour: 7,
+            day: DAY
+        }
+        .is_quiet_hours());
+        assert!(!ClockInput {
+            now_s: 0.0,
+            hour: 8,
+            day: DAY
+        }
+        .is_quiet_hours());
+        assert!(!ClockInput {
+            now_s: 0.0,
+            hour: 21,
+            day: DAY
+        }
+        .is_quiet_hours());
     }
 
     #[test]
@@ -687,7 +793,10 @@ mod tests {
         let used = sample(None, Some(60.0), ChargingState::Discharging);
 
         assert!(!tick_kind(&mut e, &charged, 0.0, AlertKind::DwellCoach));
-        assert!(tick_kind(&mut e, &charged, 600.0, AlertKind::DwellCoach), "first dwell fire");
+        assert!(
+            tick_kind(&mut e, &charged, 600.0, AlertKind::DwellCoach),
+            "first dwell fire"
+        );
 
         // Drop below 95 and come back after 1 h: latch re-arms, but the
         // 6-hour cooldown from the first fire still holds.
@@ -713,7 +822,11 @@ mod tests {
         // Next day, still parked: fires once.
         let mut next_day = 0;
         for i in 86_400..87_200 {
-            let c = ClockInput { now_s: i as f64, hour: NOON_HOUR, day: DAY + 1 };
+            let c = ClockInput {
+                now_s: i as f64,
+                hour: NOON_HOUR,
+                day: DAY + 1,
+            };
             if matches!(e.tick(&charged, c), Some(a) if a.kind == AlertKind::DwellCoach) {
                 next_day += 1;
             }
@@ -766,18 +879,27 @@ mod tests {
         assert!(tick_at(&mut e, &plugged, 10.0).is_none());
 
         // Next day: one fresh nudge.
-        let c = ClockInput { now_s: 86_400.0, hour: NOON_HOUR, day: DAY + 1 };
+        let c = ClockInput {
+            now_s: 86_400.0,
+            hour: NOON_HOUR,
+            day: DAY + 1,
+        };
         assert!(e.tick(&plugged, c).is_some());
     }
 
     #[test]
     fn band_requires_plugged_and_above_80() {
         let mut e = AlertEngine::new();
-        let unplugged_high =
-            sample(None, Some(90.0), ChargingState::Discharging);
+        let unplugged_high = sample(None, Some(90.0), ChargingState::Discharging);
         let plugged_low = sample(None, Some(50.0), ChargingState::Charging);
-        assert_eq!(run_kind(&mut e, &unplugged_high, 100.0, AlertKind::BandCoach), 0);
-        assert_eq!(run_kind(&mut e, &plugged_low, 100.0, AlertKind::BandCoach), 0);
+        assert_eq!(
+            run_kind(&mut e, &unplugged_high, 100.0, AlertKind::BandCoach),
+            0
+        );
+        assert_eq!(
+            run_kind(&mut e, &plugged_low, 100.0, AlertKind::BandCoach),
+            0
+        );
     }
 
     #[test]
@@ -800,14 +922,22 @@ mod tests {
         let s = sample(None, Some(90.0), ChargingState::Charging);
         let mut quiet_fires = 0;
         for i in 0..60 {
-            let c = ClockInput { now_s: i as f64, hour: 23, day: DAY };
+            let c = ClockInput {
+                now_s: i as f64,
+                hour: 23,
+                day: DAY,
+            };
             if e.tick(&s, c).is_some() {
                 quiet_fires += 1;
             }
         }
         assert_eq!(quiet_fires, 0);
         // Morning: the nudge still goes out that day.
-        let c = ClockInput { now_s: 100.0, hour: 8, day: DAY };
+        let c = ClockInput {
+            now_s: 100.0,
+            hour: 8,
+            day: DAY,
+        };
         assert!(e.tick(&s, c).is_some());
     }
 
@@ -836,16 +966,44 @@ mod tests {
     #[test]
     fn detected_cap_predicate_is_threshold_scoped_and_pure() {
         // On AC, not charging, at or above the threshold: a detected cap.
-        assert!(is_detected_cap(&sample(None, Some(80.0), ChargingState::OnAcNotCharging)));
-        assert!(is_detected_cap(&sample(None, Some(95.0), ChargingState::OnAcNotCharging)));
+        assert!(is_detected_cap(&sample(
+            None,
+            Some(80.0),
+            ChargingState::OnAcNotCharging
+        )));
+        assert!(is_detected_cap(&sample(
+            None,
+            Some(95.0),
+            ChargingState::OnAcNotCharging
+        )));
         // Just below the threshold: outside the band, not a cap signal.
-        assert!(!is_detected_cap(&sample(None, Some(79.9), ChargingState::OnAcNotCharging)));
+        assert!(!is_detected_cap(&sample(
+            None,
+            Some(79.9),
+            ChargingState::OnAcNotCharging
+        )));
         // Other plugged-in states in the band are not cap signals.
-        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Charging)));
-        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Discharging)));
-        assert!(!is_detected_cap(&sample(None, Some(85.0), ChargingState::Full)));
+        assert!(!is_detected_cap(&sample(
+            None,
+            Some(85.0),
+            ChargingState::Charging
+        )));
+        assert!(!is_detected_cap(&sample(
+            None,
+            Some(85.0),
+            ChargingState::Discharging
+        )));
+        assert!(!is_detected_cap(&sample(
+            None,
+            Some(85.0),
+            ChargingState::Full
+        )));
         // Missing SOC is never treated as a cap.
-        assert!(!is_detected_cap(&sample(None, None, ChargingState::OnAcNotCharging)));
+        assert!(!is_detected_cap(&sample(
+            None,
+            None,
+            ChargingState::OnAcNotCharging
+        )));
     }
 
     #[test]
@@ -893,7 +1051,11 @@ mod tests {
         let cool = sample(Some(40.0), Some(100.0), ChargingState::Charging);
         let (mut fires, mut hot_fires) = (Vec::new(), 0);
         for i in 0..1_000 {
-            let c = ClockInput { now_s: i as f64, hour: NOON_HOUR, day: DAY };
+            let c = ClockInput {
+                now_s: i as f64,
+                hour: NOON_HOUR,
+                day: DAY,
+            };
             let s = if (61..=120).contains(&i) { &cool } else { &hot };
             if let Some(a) = e.tick(s, c) {
                 fires.push((i, a.kind));
@@ -902,14 +1064,33 @@ mod tests {
                 }
             }
         }
-        assert_eq!(hot_fires, 2, "fire, resolve, re-sustain, cooldown-gated refire");
-        assert!(fires.iter().any(|&(t, k)| k == AlertKind::HighTemp && t >= 960));
+        assert_eq!(
+            hot_fires, 2,
+            "fire, resolve, re-sustain, cooldown-gated refire"
+        );
+        assert!(fires
+            .iter()
+            .any(|&(t, k)| k == AlertKind::HighTemp && t >= 960));
         assert!(
-            !fires.iter().any(|&(t, k)| k == AlertKind::HighTemp && (181..960).contains(&t)),
+            !fires
+                .iter()
+                .any(|&(t, k)| k == AlertKind::HighTemp && (181..960).contains(&t)),
             "no HighTemp fire inside the cooldown"
         );
-        assert_eq!(fires.iter().filter(|(_, k)| *k == AlertKind::DwellCoach).count(), 1);
-        assert_eq!(fires.iter().filter(|(_, k)| *k == AlertKind::BandCoach).count(), 1);
+        assert_eq!(
+            fires
+                .iter()
+                .filter(|(_, k)| *k == AlertKind::DwellCoach)
+                .count(),
+            1
+        );
+        assert_eq!(
+            fires
+                .iter()
+                .filter(|(_, k)| *k == AlertKind::BandCoach)
+                .count(),
+            1
+        );
     }
 
     // ---- FR-6: end-of-condition predicates ----------------------------------

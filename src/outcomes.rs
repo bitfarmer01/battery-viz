@@ -15,6 +15,22 @@
 //!   it stops firing in real time and its row becomes digest-channel data
 //!   (the FR-9 weekly digest absorbs retired alerts). An acted-on outcome
 //!   always resets the ignore streak.
+//! - Retirement is recoverable (re-audit N4). The heat alert never retires
+//!   (heat is a physical condition, not a habit — its cooldown and daily
+//!   limit cap it instead). A streak or retirement decays once a full
+//!   [`STREAK_DECAY_AFTER_S`] passes with no new ignored fire of that kind
+//!   (the condition stopped recurring; a retired kind's own suppressed
+//!   fires refresh the anchor, so a still-recurring condition stays
+//!   retired), and [`OutcomeStore::reactivate_all`] — wired to the app's
+//!   un-pause toggle — clears every streak and retirement on user action.
+//!   A condition that recurs after the decay re-fires and can earn a fresh
+//!   retirement.
+//! - The engine's per-kind daily caps and cooldowns are persisted here
+//!   too (schema v2, re-audit N4a): the live engine keeps its own
+//!   in-memory gates, and `on_fire` re-applies the persisted ones — so a
+//!   restart or pause toggle (which resets the engine) can neither
+//!   double-fire a notification nor resolve the previous open watch as a
+//!   manufactured Ignored.
 //!
 //! Persistence mirrors the daily record (FR-7): one versioned JSON file in
 //! the platform data dir, written atomically, an unreadable file preserved
@@ -46,6 +62,13 @@ pub const RATE_WINDOW_S: u64 = 7 * 24 * 3_600;
 /// (3 + 1 + 1 fires/day) this is years of data; the rate only needs the
 /// trailing [`RATE_WINDOW_S`].
 pub const MAX_FIRES: usize = 2_000;
+
+/// Re-audit N4b: how long an ignore streak (and a retirement built on one)
+/// survives with no new ignored fire of that kind. A still-recurring
+/// condition keeps generating fires — suppressed ones while retired — that
+/// refresh the anchor, so the decay only lifts a retirement once the
+/// condition has genuinely stopped for a week.
+pub const STREAK_DECAY_AFTER_S: u64 = 7 * 24 * 3_600;
 
 /// Number of alert kinds indexed side-by-side below.
 const KINDS: usize = 3;
@@ -129,6 +152,16 @@ pub struct OutcomeStore {
     open: [Option<OpenFire>; KINDS],
     consecutive_ignores: [u32; KINDS],
     retired: [bool; KINDS],
+    /// Re-audit N4a: persisted engine gates — unix second each kind last
+    /// fired (the cooldown re-applied across a restart) and the per-kind
+    /// daily-cap counter (`day` is the same local-day counter as `Fire`).
+    /// The live engine keeps its own in-memory gates; these are stamped on
+    /// every delivered fire and re-checked in [`Self::on_fire`], so a
+    /// restart or pause toggle can neither double-fire a notification nor
+    /// resolve the previous open watch as a manufactured Ignored.
+    last_fired_unix: [Option<u64>; KINDS],
+    daily_day: [u32; KINDS],
+    daily_count: [u32; KINDS],
 }
 
 impl Default for OutcomeStore {
@@ -151,6 +184,9 @@ impl OutcomeStore {
             open: [None, None, None],
             consecutive_ignores: [0; KINDS],
             retired: [false; KINDS],
+            last_fired_unix: [None; KINDS],
+            daily_day: [0; KINDS],
+            daily_count: [0; KINDS],
         }
     }
 
@@ -170,11 +206,25 @@ impl OutcomeStore {
         self.consecutive_ignores[kind_index(kind)]
     }
 
+    /// Re-audit N4b: clear every ignore streak and retirement — user
+    /// action (re-enabling alerts in the UI) gives a silenced kind a
+    /// fresh start. Persisted daily caps and cooldowns are NOT cleared:
+    /// re-enabling must not buy a duplicate notification for a condition
+    /// already coached today.
+    pub fn reactivate_all(&mut self) {
+        self.consecutive_ignores = [0; KINDS];
+        self.retired = [false; KINDS];
+    }
+
     /// Feed one sample: resolve open watches. Returns whether anything
     /// changed (a checkpoint hint). Missing telemetry never counts as the
     /// condition having ended — an unresolvable watch simply runs out its
     /// window.
     pub fn observe(&mut self, sample: &BatterySample, now: u64) -> bool {
+        // Retirement decays here too: this runs on every sample, even
+        // while alerts are paused, so a stale retirement lifts without
+        // waiting for a fire.
+        let decayed = self.decay_stale_streaks(now);
         let mut changed = false;
         for i in 0..KINDS {
             let Some(open) = self.open[i] else {
@@ -193,14 +243,18 @@ impl OutcomeStore {
                 changed = true;
             }
         }
-        changed
+        changed || decayed
     }
 
     /// Record an engine fire of `kind` at `now`. Returns whether the alert
-    /// should be delivered in real time — `false` once the kind is retired
-    /// (the fire is still logged, undelivered, for the digest).
+    /// should be delivered in real time. A `false` return has two distinct
+    /// meanings: a retired kind logs the fire undelivered (for the digest),
+    /// while a blocked persisted gate — a spent daily cap or a running
+    /// cooldown (N4a) — drops the fire entirely, logging nothing, because
+    /// the original fire is already in the log.
     pub fn on_fire(&mut self, kind: AlertKind, day: u32, now: u64) -> bool {
-        if self.retired[kind_index(kind)] {
+        let i = kind_index(kind);
+        if self.retired[i] {
             self.push(Fire {
                 kind,
                 day,
@@ -210,12 +264,22 @@ impl OutcomeStore {
             });
             return false;
         }
+        // Re-audit N4a: re-apply the persisted engine gates. The engine's
+        // own daily cap and cooldown are in-memory; after a restart or a
+        // pause toggle (which resets the engine) it fires again for a
+        // condition whose daily cap was already spent or whose cooldown is
+        // still running. The duplicate is dropped WITHOUT logging — the
+        // original fire is already in the log — so the earlier fire is not
+        // resolved as a manufactured Ignored and no notification repeats.
+        if self.persisted_gate_blocks(i, day, now) {
+            return false;
+        }
         // A new fire supersedes any open watch for the kind. Unreachable in
         // practice for delivered fires (a re-fire requires the condition to
         // have ended, which `observe` would have resolved first), but the
         // invariant "at most one open watch per kind" must hold regardless.
-        if self.open[kind_index(kind)].is_some() {
-            self.resolve(kind_index(kind), Outcome::Ignored);
+        if self.open[i].is_some() {
+            self.resolve(i, Outcome::Ignored);
         }
         self.push(Fire {
             kind,
@@ -224,8 +288,67 @@ impl OutcomeStore {
             delivered: true,
             outcome: Outcome::Pending,
         });
-        self.open[kind_index(kind)] = Some(OpenFire { fired_at: now });
+        self.open[i] = Some(OpenFire { fired_at: now });
+        // Stamp the persisted gates for the next restart.
+        self.last_fired_unix[i] = Some(now);
+        if self.daily_day[i] == day {
+            self.daily_count[i] = self.daily_count[i].saturating_add(1);
+        } else {
+            self.daily_day[i] = day;
+            self.daily_count[i] = 1;
+        }
         true
+    }
+
+    /// Re-audit N4a: would the persisted daily cap or cooldown block a
+    /// fire of kind index `i` at local `day` / unix `now`? The same caps
+    /// the live engine enforces, re-applied to the last state that
+    /// survived a restart.
+    fn persisted_gate_blocks(&self, i: usize, day: u32, now: u64) -> bool {
+        let Ok(kind) = kind_from_index(i) else {
+            return false; // Index is built from the same enum; unreachable.
+        };
+        let spent_today = if self.daily_day[i] == day {
+            self.daily_count[i]
+        } else {
+            0
+        };
+        if spent_today >= kind.daily_cap() {
+            return true;
+        }
+        let cooldown = kind.cooldown_secs();
+        if cooldown == 0 {
+            return false;
+        }
+        self.last_fired_unix[i].is_some_and(|t| now.saturating_sub(t) < cooldown)
+    }
+
+    /// Re-audit N4b: retirements and streaks decay. A kind's streak dies
+    /// (and with it any retirement) once [`STREAK_DECAY_AFTER_S`] passes
+    /// with no new ignored fire of that kind — the condition stopped
+    /// recurring. A retired kind's own suppressed fires count as ignored
+    /// fires and refresh the anchor, so a still-recurring condition stays
+    /// retired until the user re-enables or the recurrence stops. Fires
+    /// older than the log cap anchor at zero (decade-old history: decay).
+    fn decay_stale_streaks(&mut self, now: u64) -> bool {
+        let mut changed = false;
+        for i in 0..KINDS {
+            if self.consecutive_ignores[i] == 0 && !self.retired[i] {
+                continue;
+            }
+            let anchor = self
+                .fires
+                .iter()
+                .rev()
+                .find(|f| kind_index(f.kind) == i && f.outcome == Outcome::Ignored)
+                .map_or(0, |f| f.fired_at);
+            if now.saturating_sub(anchor) >= STREAK_DECAY_AFTER_S {
+                self.consecutive_ignores[i] = 0;
+                self.retired[i] = false;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Close the open watch of kind index `i` with `outcome`, updating the
@@ -250,9 +373,14 @@ impl OutcomeStore {
         match outcome {
             Outcome::Acted => self.consecutive_ignores[i] = 0,
             Outcome::Ignored => {
-                self.consecutive_ignores[i] = self.consecutive_ignores[i].saturating_add(1);
-                if self.consecutive_ignores[i] >= self.retire_after {
-                    self.retired[i] = true;
+                // Re-audit N4c: heat is a physical condition, not a habit —
+                // the heat alert is capped by its cooldown and daily limit
+                // and never counts toward (or reaches) retirement.
+                if kind.retirable() {
+                    self.consecutive_ignores[i] = self.consecutive_ignores[i].saturating_add(1);
+                    if self.consecutive_ignores[i] >= self.retire_after {
+                        self.retired[i] = true;
+                    }
                 }
             }
             Outcome::Pending => {}
@@ -299,13 +427,17 @@ impl OutcomeStore {
     }
 
     /// Serialize to the on-disk JSON schema:
-    /// `{"version":1,"retire_after":3,"consecutive":[..],"retired":[..],
+    /// `{"version":2,"retire_after":3,"consecutive":[..],"retired":[..],
+    ///   "engine":{"last_fired":[..],"daily_day":[..],"daily_count":[..]},
     ///   "fires":[[kind,day,fired_at,delivered,outcome],...]}`
-    /// (booleans as 0/1). Rust's f64 Display round-trips.
+    /// (booleans as 0/1, never-fired cooldowns as -1). Rust's f64 Display
+    /// round-trips. Version 2 adds the persisted engine gates (re-audit
+    /// N4a); version 1 files without them still load.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(40 * self.fires.len() + 96);
+        let fired = |t: Option<u64>| t.map_or(-1.0, |v| v as f64);
+        let mut out = String::with_capacity(40 * self.fires.len() + 160);
         out.push_str(&format!(
-            "{{\"version\":1,\"retire_after\":{},\"consecutive\":[{},{},{}],\"retired\":[{},{},{}],\"fires\":[",
+            "{{\"version\":2,\"retire_after\":{},\"consecutive\":[{},{},{}],\"retired\":[{},{},{}],\"engine\":{{\"last_fired\":[{},{},{}],\"daily_day\":[{},{},{}],\"daily_count\":[{},{},{}]}},\"fires\":[",
             self.retire_after,
             self.consecutive_ignores[0],
             self.consecutive_ignores[1],
@@ -313,6 +445,15 @@ impl OutcomeStore {
             self.retired[0] as u8,
             self.retired[1] as u8,
             self.retired[2] as u8,
+            fired(self.last_fired_unix[0]),
+            fired(self.last_fired_unix[1]),
+            fired(self.last_fired_unix[2]),
+            self.daily_day[0],
+            self.daily_day[1],
+            self.daily_day[2],
+            self.daily_count[0],
+            self.daily_count[1],
+            self.daily_count[2],
         ));
         for (i, f) in self.fires.iter().enumerate() {
             if i > 0 {
@@ -340,7 +481,9 @@ impl OutcomeStore {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        if version != 1.0 {
+        // v2 adds the persisted engine gates (re-audit N4a); v1 files
+        // without them load with the gates defaulted.
+        if version != 1.0 && version != 2.0 {
             return Err(format!("unsupported schema version {version}"));
         }
         p.skip_ws();
@@ -378,6 +521,53 @@ impl OutcomeStore {
                 0.0 => retired[i] = false,
                 1.0 => retired[i] = true,
                 other => return Err(format!("invalid retired flag {other}")),
+            }
+        }
+        // Schema v2: the persisted engine gates. `-1` encodes "never fired".
+        let mut last_fired_unix = [None; KINDS];
+        let mut daily_day = [0u32; KINDS];
+        let mut daily_count = [0u32; KINDS];
+        if version >= 2.0 {
+            p.skip_ws();
+            p.expect(b',')?;
+            p.expect_key("engine")?;
+            p.skip_ws();
+            p.expect(b'{')?;
+            p.expect_key("last_fired")?;
+            p.skip_ws();
+            p.expect(b'[')?;
+            let fired_f = p.number_list()?;
+            p.skip_ws();
+            p.expect(b',')?;
+            p.expect_key("daily_day")?;
+            p.skip_ws();
+            p.expect(b'[')?;
+            let day_f = p.number_list()?;
+            p.skip_ws();
+            p.expect(b',')?;
+            p.expect_key("daily_count")?;
+            p.skip_ws();
+            p.expect(b'[')?;
+            let count_f = p.number_list()?;
+            p.skip_ws();
+            p.expect(b'}')?;
+            if fired_f.len() != KINDS || day_f.len() != KINDS || count_f.len() != KINDS {
+                return Err("engine gate arrays must have 3 entries".to_string());
+            }
+            for i in 0..KINDS {
+                if fired_f[i] < -1.0 || fired_f[i].fract() != 0.0 {
+                    return Err(format!("invalid last_fired {}", fired_f[i]));
+                }
+                last_fired_unix[i] = (fired_f[i] >= 0.0).then_some(fired_f[i] as u64);
+                for (slot, v, what) in [
+                    (&mut daily_day[i], day_f[i], "daily_day"),
+                    (&mut daily_count[i], count_f[i], "daily_count"),
+                ] {
+                    if v < 0.0 || v.fract() != 0.0 {
+                        return Err(format!("invalid {what} {v}"));
+                    }
+                    *slot = v as u32;
+                }
             }
         }
         p.skip_ws();
@@ -431,6 +621,9 @@ impl OutcomeStore {
             open,
             consecutive_ignores: consecutive,
             retired,
+            last_fired_unix,
+            daily_day,
+            daily_count,
         })
     }
 
@@ -537,10 +730,13 @@ mod tests {
         let mut s = OutcomeStore::with_retire_after(3);
         let t = 1_000_000u64;
         let plugged = sample(None, Some(90.0), ChargingState::Charging);
-        for round in 0..3 {
-            assert!(s.on_fire(AlertKind::BandCoach, DAY, t + round * 10_000));
+        // One fire per local day (the persisted daily cap is spent after
+        // the first): fire, never unplug, let the outcome window expire.
+        for round in 0..3u64 {
+            let day = DAY + round as u32;
+            assert!(s.on_fire(AlertKind::BandCoach, day, t + round * 86_400));
             assert!(
-                s.observe(&plugged, t + round * 10_000 + OUTCOME_WINDOW_S),
+                s.observe(&plugged, t + round * 86_400 + OUTCOME_WINDOW_S),
                 "ignore {round} resolves at window expiry"
             );
         }
@@ -549,10 +745,10 @@ mod tests {
             "3 consecutive ignores must retire"
         );
         // After retirement the alert no longer fires in real time...
-        assert!(!s.on_fire(AlertKind::BandCoach, DAY, t + 40_000));
+        assert!(!s.on_fire(AlertKind::BandCoach, DAY + 3, t + 4 * 86_400));
         // ...but the fire is still logged, undelivered, for the digest.
         let logged = s
-            .acted_on_rate(AlertKind::BandCoach, t + 40_000)
+            .acted_on_rate(AlertKind::BandCoach, t + 4 * 86_400)
             .map(|(_, total)| total)
             .unwrap_or(0);
         assert_eq!(logged, 3, "suppressed fire must not count as delivered");
@@ -563,24 +759,26 @@ mod tests {
         let mut s = OutcomeStore::with_retire_after(3);
         let t = 1_000_000u64;
         let plugged = sample(None, Some(90.0), ChargingState::Charging);
-        // Two ignores...
-        for round in 0..2 {
-            s.on_fire(AlertKind::BandCoach, DAY, t + round * 10_000);
-            s.observe(&plugged, t + round * 10_000 + OUTCOME_WINDOW_S);
+        // Two ignores on consecutive days (one fire per day — the daily
+        // cap)...
+        for round in 0..2u64 {
+            s.on_fire(AlertKind::BandCoach, DAY + round as u32, t + round * 86_400);
+            s.observe(&plugged, t + round * 86_400 + OUTCOME_WINDOW_S);
         }
         assert_eq!(s.ignore_streak(AlertKind::BandCoach), 2);
         // ...then an acted-on alert resets the streak: no retirement.
-        assert!(s.on_fire(AlertKind::BandCoach, DAY, t + 20_000));
+        assert!(s.on_fire(AlertKind::BandCoach, DAY + 2, t + 2 * 86_400));
         assert!(s.observe(
             &sample(None, Some(50.0), ChargingState::Discharging),
-            t + 20_100
+            t + 2 * 86_400 + 100
         ));
         assert_eq!(s.ignore_streak(AlertKind::BandCoach), 0);
         assert!(!s.is_retired(AlertKind::BandCoach));
-        // Streak restarts from zero: two more ignores still do not retire.
-        for round in 3..5 {
-            s.on_fire(AlertKind::BandCoach, DAY, t + round * 10_000);
-            s.observe(&plugged, t + round * 10_000 + OUTCOME_WINDOW_S);
+        // Streak restarts from zero: two more ignores (the next two days)
+        // still do not retire.
+        for round in 3..5u64 {
+            s.on_fire(AlertKind::BandCoach, DAY + round as u32, t + round * 86_400);
+            s.observe(&plugged, t + round * 86_400 + OUTCOME_WINDOW_S);
         }
         assert_eq!(s.ignore_streak(AlertKind::BandCoach), 2);
         assert!(!s.is_retired(AlertKind::BandCoach));
@@ -589,37 +787,39 @@ mod tests {
     #[test]
     fn acted_on_rate_is_a_trailing_week_and_only_over_delivered_fires() {
         let mut s = OutcomeStore::with_retire_after(2);
-        let t = 1_000_000u64;
-        let week = RATE_WINDOW_S;
+        // The read point for the trailing week; fires are spread over
+        // distinct local days (the persisted daily cap is one per day).
+        let now = 2_000_000u64;
+        let day_len = 86_400u64;
         // Outside the window: one delivered acted-on fire, a week and an
         // hour ago.
-        s.on_fire(AlertKind::DwellCoach, DAY, t - 3_600);
+        s.on_fire(AlertKind::DwellCoach, DAY, now - 8 * day_len);
         s.observe(
             &sample(None, Some(50.0), ChargingState::Discharging),
-            t - 3_540,
+            now - 8 * day_len + 60,
         );
-        // Inside the window: one acted on, one ignored, one suppressed.
-        s.on_fire(AlertKind::DwellCoach, DAY, t + week - 100);
+        // Inside the window: one acted on, one ignored, one ignored that
+        // retires (N=2), then a suppressed fire the next day.
+        s.on_fire(AlertKind::DwellCoach, DAY + 1, now - 4 * day_len);
         s.observe(
             &sample(None, Some(50.0), ChargingState::Discharging),
-            t + week - 90,
+            now - 4 * day_len + 60,
         );
-        s.on_fire(AlertKind::DwellCoach, DAY, t + week - 50);
+        s.on_fire(AlertKind::DwellCoach, DAY + 2, now - 3 * day_len);
         s.observe(
             &sample(None, Some(98.0), ChargingState::Charging),
-            t + week - 40 + OUTCOME_WINDOW_S,
+            now - 3 * day_len + OUTCOME_WINDOW_S,
         );
-        // Retire DwellCoach so the next fire is suppressed.
-        s.on_fire(AlertKind::DwellCoach, DAY, t + week - 30);
+        s.on_fire(AlertKind::DwellCoach, DAY + 3, now - 2 * day_len);
         s.observe(
             &sample(None, Some(98.0), ChargingState::Charging),
-            t + week - 20 + OUTCOME_WINDOW_S,
+            now - 2 * day_len + OUTCOME_WINDOW_S,
         );
         assert!(s.is_retired(AlertKind::DwellCoach));
-        s.on_fire(AlertKind::DwellCoach, DAY, t + week - 10);
+        s.on_fire(AlertKind::DwellCoach, DAY + 4, now - day_len);
 
         let (acted, total) = s
-            .acted_on_rate(AlertKind::DwellCoach, t + week)
+            .acted_on_rate(AlertKind::DwellCoach, now)
             .expect("fires inside the window");
         assert_eq!(
             (acted, total),
@@ -628,11 +828,11 @@ mod tests {
         );
         // Sliding the window past every fire empties the rate.
         assert_eq!(
-            s.acted_on_rate(AlertKind::DwellCoach, t + week + 200 + RATE_WINDOW_S),
+            s.acted_on_rate(AlertKind::DwellCoach, now + 200 + RATE_WINDOW_S),
             None
         );
         // Other kinds stay empty.
-        assert_eq!(s.acted_on_rate(AlertKind::HighTemp, t + week), None);
+        assert_eq!(s.acted_on_rate(AlertKind::HighTemp, now), None);
     }
 
     #[test]
@@ -648,8 +848,10 @@ mod tests {
         let plugged = sample(None, Some(98.0), ChargingState::Charging);
         s.on_fire(AlertKind::DwellCoach, DAY, t + 100);
         s.observe(&plugged, t + 100 + OUTCOME_WINDOW_S);
-        s.on_fire(AlertKind::DwellCoach, DAY, t + 200);
-        s.observe(&plugged, t + 200 + OUTCOME_WINDOW_S);
+        // Second ignore the next day (the persisted daily cap is one per
+        // day).
+        s.on_fire(AlertKind::DwellCoach, DAY + 1, t + 100 + 86_400);
+        s.observe(&plugged, t + 100 + 86_400 + OUTCOME_WINDOW_S);
         // BandCoach: fire left pending — the watch must survive the trip.
         s.on_fire(AlertKind::BandCoach, DAY, t + 300);
 
@@ -720,17 +922,23 @@ mod tests {
         let mut s = OutcomeStore::new();
         let t = 1_000_000u64;
         // HighTemp has no retire interference here: on_fire into a fresh
-        // store repeatedly (the engine's caps do not apply to the store).
+        // store repeatedly (the engine's caps do not apply to the store),
+        // one per local day so the persisted daily cap and cooldown never
+        // gate a fire.
         for i in 0..(MAX_FIRES + 50) {
-            s.on_fire(AlertKind::HighTemp, DAY, t + i as u64);
+            s.on_fire(AlertKind::HighTemp, DAY + i as u32, t + i as u64 * 86_400);
             // Resolve as acted-on so it stays deliverable.
             s.observe(
                 &sample(Some(30.0), None, ChargingState::Discharging),
-                t + i as u64,
+                t + i as u64 * 86_400,
             );
         }
         assert_eq!(s.fires.len(), MAX_FIRES);
-        assert_eq!(s.fires[0].fired_at, t + 50, "oldest fires evicted first");
+        assert_eq!(
+            s.fires[0].fired_at,
+            t + 50 * 86_400,
+            "oldest fires evicted first"
+        );
     }
 
     #[test]
@@ -775,6 +983,141 @@ mod tests {
             .acted_on_rate(AlertKind::HighTemp, t)
             .expect("delivered fire");
         assert_eq!(acted, 0);
-        assert_eq!(s.ignore_streak(AlertKind::HighTemp), 1);
+        // Re-audit N4c: heat never accumulates an ignore streak — it is
+        // capped by its cooldown and daily limit instead.
+        assert_eq!(s.ignore_streak(AlertKind::HighTemp), 0);
+        assert!(!s.is_retired(AlertKind::HighTemp));
+    }
+
+    // ---- Re-audit N4: recoverable retirement, persisted gates --------------
+
+    #[test]
+    fn heat_alert_never_retires_no_matter_how_often_ignored() {
+        let mut s = OutcomeStore::with_retire_after(3);
+        let t = 1_000_000u64;
+        let hot = sample(None, Some(90.0), ChargingState::Charging);
+        // Five long hot sessions on consecutive days, each ignored.
+        for round in 0..5u64 {
+            assert!(s.on_fire(AlertKind::HighTemp, DAY + round as u32, t + round * 86_400));
+            s.observe(&hot, t + round * 86_400 + OUTCOME_WINDOW_S);
+        }
+        assert!(
+            !s.is_retired(AlertKind::HighTemp),
+            "heat is a physical condition, not a habit — no retirement"
+        );
+        assert_eq!(s.ignore_streak(AlertKind::HighTemp), 0);
+        // And it still delivers: cooldown (15 min) and the day have passed.
+        assert!(s.on_fire(AlertKind::HighTemp, DAY + 5, t + 5 * 86_400));
+    }
+
+    #[test]
+    fn retirement_decays_after_a_quiet_week_and_the_kind_refires() {
+        let mut s = OutcomeStore::with_retire_after(2);
+        let t = 1_000_000u64;
+        let plugged = sample(None, Some(90.0), ChargingState::Charging);
+        for round in 0..2u64 {
+            s.on_fire(AlertKind::BandCoach, DAY + round as u32, t + round * 86_400);
+            s.observe(&plugged, t + round * 86_400 + OUTCOME_WINDOW_S);
+        }
+        assert!(s.is_retired(AlertKind::BandCoach));
+        // The condition stops recurring: a full quiet week later the
+        // decay lifts the retirement on the next observe...
+        let late = t + 2 * 86_400 + STREAK_DECAY_AFTER_S;
+        assert!(s.observe(&sample(None, Some(50.0), ChargingState::Discharging), late));
+        assert!(!s.is_retired(AlertKind::BandCoach), "decayed");
+        assert_eq!(s.ignore_streak(AlertKind::BandCoach), 0);
+        // ...and a recurrence fires (and delivers) again.
+        let late_day = DAY + 2 + (STREAK_DECAY_AFTER_S / 86_400) as u32;
+        assert!(s.on_fire(AlertKind::BandCoach, late_day, late + 60));
+    }
+
+    #[test]
+    fn a_retired_kind_stays_retired_while_its_condition_keeps_recurring() {
+        let mut s = OutcomeStore::with_retire_after(1);
+        let t = 1_000_000u64;
+        let plugged = sample(None, Some(90.0), ChargingState::Charging);
+        s.on_fire(AlertKind::BandCoach, DAY, t);
+        s.observe(&plugged, t + OUTCOME_WINDOW_S);
+        assert!(s.is_retired(AlertKind::BandCoach));
+        // The condition recurs daily: suppressed fires are logged (they
+        // refresh the decay anchor), so the retirement holds.
+        for d in 1..=8u32 {
+            assert!(!s.on_fire(AlertKind::BandCoach, DAY + d, t + d as u64 * 86_400));
+            s.observe(&plugged, t + d as u64 * 86_400 + OUTCOME_WINDOW_S);
+            assert!(
+                s.is_retired(AlertKind::BandCoach),
+                "recurrence keeps the retirement"
+            );
+        }
+        // A full quiet week after the last suppressed fire: decay lifts it.
+        let late = t + 8 * 86_400 + STREAK_DECAY_AFTER_S;
+        assert!(s.observe(&sample(None, Some(50.0), ChargingState::Discharging), late));
+        assert!(!s.is_retired(AlertKind::BandCoach));
+    }
+
+    #[test]
+    fn reactivation_clears_every_streak_and_retirement() {
+        let mut s = OutcomeStore::with_retire_after(1);
+        let t = 1_000_000u64;
+        let plugged = sample(None, Some(90.0), ChargingState::Charging);
+        s.on_fire(AlertKind::BandCoach, DAY, t);
+        s.observe(&plugged, t + OUTCOME_WINDOW_S);
+        assert!(s.is_retired(AlertKind::BandCoach));
+        s.reactivate_all();
+        assert!(!s.is_retired(AlertKind::BandCoach));
+        assert_eq!(s.ignore_streak(AlertKind::BandCoach), 0);
+        // A fresh streak can build and retire again — a re-fire after the
+        // condition genuinely recurs is possible.
+        let day2 = DAY + 1;
+        assert!(s.on_fire(AlertKind::BandCoach, day2, t + 86_400));
+        s.observe(&plugged, t + 86_400 + OUTCOME_WINDOW_S);
+        assert!(s.is_retired(AlertKind::BandCoach));
+    }
+
+    #[test]
+    fn persisted_daily_cap_blocks_a_restart_refire_without_manufacturing_an_ignore() {
+        let mut s = OutcomeStore::with_retire_after(3);
+        let t = 1_000_000u64;
+        // Day 1: the band coach fires and is delivered.
+        assert!(s.on_fire(AlertKind::BandCoach, DAY, t));
+        // "Restart": reload from the serialized store — the engine's
+        // in-memory daily counter is gone.
+        let mut s2 = OutcomeStore::from_json(&s.to_json()).expect("parse");
+        // Same day, the fresh engine fires again: the persisted daily cap
+        // blocks it — no duplicate notification, no manufactured ignore.
+        assert!(!s2.on_fire(AlertKind::BandCoach, DAY, t + 60));
+        assert_eq!(
+            s2.acted_on_rate(AlertKind::BandCoach, t + 60)
+                .map(|(_, total)| total),
+            Some(1),
+            "the duplicate is not logged at all"
+        );
+        // Next day the cap resets and the fire goes out.
+        assert!(s2.on_fire(AlertKind::BandCoach, DAY + 1, t + 86_400));
+    }
+
+    #[test]
+    fn persisted_cooldown_survives_a_restart() {
+        let mut s = OutcomeStore::with_retire_after(3);
+        let t = 1_000_000u64;
+        assert!(s.on_fire(AlertKind::HighTemp, DAY, t));
+        let mut s2 = OutcomeStore::from_json(&s.to_json()).expect("parse");
+        // Inside the 15-minute cooldown: blocked without logging.
+        assert!(!s2.on_fire(AlertKind::HighTemp, DAY, t + 600));
+        // Past it (day cap of 3 not spent): allowed.
+        assert!(s2.on_fire(AlertKind::HighTemp, DAY, t + 900));
+    }
+
+    #[test]
+    fn v1_store_without_engine_gates_loads_with_defaults() {
+        // A pre-N4 file: no "engine" section, Band retired, Dwell streak 1.
+        let text = format!(
+            "{{\"version\":1,\"retire_after\":3,\"consecutive\":[0,1,0],\"retired\":[0,0,1],\"fires\":[[2,{DAY},1000000,0,2]]}}"
+        );
+        let mut s = OutcomeStore::from_json(&text).expect("v1 loads");
+        assert!(s.is_retired(AlertKind::BandCoach));
+        assert_eq!(s.ignore_streak(AlertKind::DwellCoach), 1);
+        // Gates default to "never fired": a live kind's fire goes out.
+        assert!(s.on_fire(AlertKind::HighTemp, DAY, 1_000_000));
     }
 }
