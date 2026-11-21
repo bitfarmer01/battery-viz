@@ -28,6 +28,12 @@ pub fn lock_path() -> PathBuf {
 /// must exit instead of racing a second dashboard on the same files.
 pub fn acquire(lock_path: &Path) -> Result<InstanceGuard, String> {
     use std::io::Write;
+    // First launch (or first launch after uninstall) has no data dir yet:
+    // create the parent before opening the lock file, or File::create hits
+    // ENOENT and the app silently never starts.
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
     let mut file =
         File::create(lock_path).map_err(|e| format!("create {}: {e}", lock_path.display()))?;
     file.try_lock().map_err(|e| {
@@ -67,6 +73,22 @@ mod tests {
         let path = temp_lock("reacquire");
         drop(acquire(&path).expect("first acquire"));
         acquire(&path).expect("re-acquire after the guard is dropped");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // B1 regression: on a true first launch the data dir does not exist yet.
+    // The test must NOT pre-create the parent — that is exactly the gap the
+    // original code fell into (ENOENT, app never starts).
+    #[test]
+    fn first_launch_creates_the_lock_directory() {
+        let path = temp_lock("first-launch-missing-parent");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(
+            !path.parent().unwrap().exists(),
+            "the parent dir must be absent to reproduce the first-launch condition"
+        );
+        let _guard = acquire(&path).expect("acquire must create the missing parent dir");
+        assert!(path.is_file(), "the lock file exists after first acquire");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

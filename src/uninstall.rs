@@ -87,7 +87,7 @@ fn ps_quote(s: &str) -> String {
 #[cfg(any(target_os = "windows", test))]
 fn windows_removal_command(exe: &str, aumid_key_ps: &str) -> String {
     format!(
-        "Remove-Item {}; Remove-Item -Path {}",
+        "Remove-Item {}; Remove-Item -Path {} -Recurse",
         ps_quote(exe),
         ps_quote(aumid_key_ps)
     )
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(
             cmd,
             "Remove-Item 'C:\\Apps\\battery-viz.exe'; Remove-Item -Path \
-             'HKCU:\\SOFTWARE\\Classes\\AppUserModelId\\Battery Viz'"
+             'HKCU:\\SOFTWARE\\Classes\\AppUserModelId\\Battery Viz' -Recurse"
         );
     }
 
