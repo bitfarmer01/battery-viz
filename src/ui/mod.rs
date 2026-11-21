@@ -497,8 +497,8 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
             ui.colored_label(
                 egui::Color32::from_rgb(120, 200, 130),
                 format!(
-                    "💡 Cap level: {}% covers your usage — the lowest charge reached in {} days of history was {:.0}%.",
-                    rec.level_pct, rec.days, rec.lowest_pct
+                    "💡 Cap level: {}% covers your usage — your deepest daily drain in {} days of history was {:.0}%, and the level leaves a 20% reserve above it.",
+                    rec.level_pct, rec.days, rec.usage_pct
                 ),
             );
         }
@@ -509,10 +509,10 @@ fn draw_live_gauges(ui: &mut egui::Ui, app: &App) {
                 MIN_HISTORY_DAYS.saturating_sub(days)
             ));
         }
-        CapAssessment::NoFit { lowest_pct, days } => {
+        CapAssessment::NoFit { usage_pct, days } => {
             ui.add_space(4.0);
             ui.weak(format!(
-                "No cap level on this machine covers your usage (lowest charge {lowest_pct:.0}% over {days} days) — leave the cap at its highest.",
+                "No cap level on this machine covers your usage (deepest daily drain {usage_pct:.0}% over {days} days) — leave the cap at its highest.",
             ));
         }
         CapAssessment::Unsupported => {}
@@ -557,8 +557,8 @@ fn draw_cap_setup_prompt(ctx: &egui::Context, app: &mut App) {
             CapAssessment::Recommend(rec) => {
                 ui.add_space(2.0);
                 ui.label(format!(
-                    "From {} days of history: the lowest charge reached was {:.0}%. A cap at {}% still covers your usage — set that if it is offered.",
-                    rec.days, rec.lowest_pct, rec.level_pct
+                    "From {} days of history: your deepest daily drain was {:.0}%. A cap at {}% covers it with a 20% reserve — set that if it is offered.",
+                    rec.days, rec.usage_pct, rec.level_pct
                 ));
             }
             CapAssessment::NeedHistory { .. } => {

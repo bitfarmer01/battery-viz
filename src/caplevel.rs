@@ -1,12 +1,20 @@
 //! FR-2 (longevity roadmap): cap-level recommendation.
 //!
-//! From the recorded daily history (FR-7's store), find the lowest charge
-//! reached on a normal day and recommend the lowest cap level that still
-//! covers it. Which levels exist on a machine is never guessed here: the
-//! FR-0 capability adapter reports the cap options (macOS 80–100% in 5%
-//! steps; Windows: whatever the maker module offers). When the adapter
-//! reports no cap control, or no offered level covers the observed usage,
-//! the feature degrades to advice or hides itself — nothing is invented.
+//! From the recorded daily history (FR-7's store), measure how deep the
+//! user actually drains while unplugged — the deepest day's unplugged
+//! discharge range — and recommend the lowest cap level that leaves a 20%
+//! reserve above that usage. Which levels exist on a machine is never
+//! guessed here: the FR-0 capability adapter reports the cap options
+//! (macOS 80–100% in 5% steps; Windows: whatever the maker module offers).
+//! When the adapter reports no cap control, or no offered level covers the
+//! observed usage, the feature degrades to advice or hides itself —
+//! nothing is invented.
+//!
+//! (Re-audit N1: the recommendation is anchored to daily *usage*, not to
+//! the lowest charge ever reached. A user draining 100% → 8% daily is not
+//! covered by any cap — that usage exceeds every level and says so
+//! (`NoFit`) — and a user who never unplugs has no usage to cover, so the
+//! floor governs, not the parked charge.)
 //!
 //! Pure logic only: no I/O, no clock, no platform branches. The app calls
 //! [`assess`] with the current record and the adapter's [`CapOptions`].
@@ -29,15 +37,21 @@ pub const MIN_HISTORY_DAYS: u32 = 7;
 /// charge, however light the recorded usage was.
 pub const FLOOR_PCT: f64 = 20.0;
 
-/// A cap-level recommendation: the level to set, the lowest charge the
-/// recorded history actually reached (before the [`FLOOR_PCT`] floor), and
-/// how many qualified days backed it.
+/// Re-audit N1: headroom above the deepest daily usage — the cap must
+/// cover a user's actual drain *plus* this reserve, so a full day away
+/// from the wall never ends below the cap.
+pub const RESERVE_PCT: f64 = 20.0;
+
+/// A cap-level recommendation: the level to set, the deepest daily
+/// unplugged discharge the recorded history observed (before any reserve
+/// or floor), and how many qualified days backed it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CapRecommendation {
     /// The lowest offered cap level that still covers the usage, percent.
     pub level_pct: u8,
-    /// Lowest charge reached on any qualified normal day, percent.
-    pub lowest_pct: f64,
+    /// Deepest daily unplugged discharge observed, in percentage points
+    /// (the day's unplugged high minus its unplugged low, deepest day).
+    pub usage_pct: f64,
     /// Qualified days the statistic is built from (≥ [`MIN_HISTORY_DAYS`]).
     pub days: u32,
 }
@@ -56,8 +70,8 @@ pub enum CapAssessment {
     /// The recorded usage is deeper than any cap level the machine offers;
     /// recommending one would under-cover it, so the app says so instead.
     NoFit {
-        /// Lowest charge reached on any qualified normal day, percent.
-        lowest_pct: f64,
+        /// Deepest daily unplugged discharge observed, percentage points.
+        usage_pct: f64,
         /// Qualified days the statistic is built from.
         days: u32,
     },
@@ -71,36 +85,42 @@ pub fn assess(record: &DailyRecord, options: &CapOptions) -> CapAssessment {
     if levels.is_empty() {
         return CapAssessment::Unsupported;
     }
-    // The lowest charge reached, over qualified normal days: the minimum of
-    // the days' minima — the deepest dip the user actually took. Days with
-    // no state-of-charge readings (or too few) never contribute.
+    // Qualified normal days gate the history, exactly as before: a day with
+    // too few SoC readings never counts, and exclusion of thin days only
+    // lowers the day count (more `NeedHistory`), never the target.
+    //
+    // The usage statistic (re-audit N1): the deepest single day's unplugged
+    // discharge range — how far below its unplugged peak the user actually
+    // took the pack. A machine that never unplugs has no range on any day
+    // and reads as zero usage; a parked level is not consumption.
     let mut days = 0u32;
-    let mut lowest: Option<f64> = None;
+    let mut deepest: Option<f64> = None;
     for row in &record.rows {
         if row.soc_n < MIN_DAY_SAMPLES {
             continue;
         }
-        let Some(min) = row.soc_min else {
-            continue;
-        };
         days += 1;
-        lowest = Some(lowest.map_or(min, |l: f64| l.min(min)));
+        if let (Some(max), Some(min)) = (row.disch_max, row.disch_min) {
+            let usage = max - min;
+            deepest = Some(deepest.map_or(usage, |d: f64| d.max(usage)));
+        }
     }
     if days < MIN_HISTORY_DAYS {
         return CapAssessment::NeedHistory { days };
     }
-    let lowest = lowest.unwrap_or(FLOOR_PCT);
-    // The floor governs when the recorded usage ran deeper than it: the
-    // recommendation never endorses a cap below 20%, on any history.
-    let target = lowest.max(FLOOR_PCT);
+    let usage = deepest.unwrap_or(0.0);
+    // The cap covers the deepest daily usage plus a 20% reserve — and the
+    // floor still governs: the recommendation never endorses a cap below
+    // 20%, on any history.
+    let target = (usage + RESERVE_PCT).max(FLOOR_PCT);
     match levels.iter().copied().find(|&level| level as f64 >= target) {
         Some(level_pct) => CapAssessment::Recommend(CapRecommendation {
             level_pct,
-            lowest_pct: lowest,
+            usage_pct: usage,
             days,
         }),
         None => CapAssessment::NoFit {
-            lowest_pct: lowest,
+            usage_pct: usage,
             days,
         },
     }
@@ -132,24 +152,38 @@ mod tests {
     use super::*;
     use crate::caps::{CapOptions, CapRange};
 
-    /// A record with `days` normal days, each having dipped to `dip` percent.
-    fn record_with_dips(days: u32, dip: f64) -> DailyRecord {
+    /// A sample observed while unplugged (discharging).
+    fn unplugged(soc: f64) -> crate::collect::BatterySample {
+        crate::collect::BatterySample {
+            state_of_charge: Some(soc),
+            charging_state: Some(crate::collect::types::ChargingState::Discharging),
+            ..Default::default()
+        }
+    }
+
+    /// A record with `days` normal days, each draining unplugged from `top`
+    /// down to `bottom` — the day's usage is `top − bottom` — then topping
+    /// back up on AC long enough to qualify.
+    fn record_with_usage(days: u32, top: f64, bottom: f64) -> DailyRecord {
         let mut rec = DailyRecord::default();
         for day in 0..days {
-            fold_day(&mut rec, day, dip);
+            fold_usage_day(&mut rec, day, top, bottom);
         }
         rec
     }
 
-    /// Fold one normal day (≥ `MIN_DAY_SAMPLES` SoC samples) whose minimum
-    /// is `dip`, peaking at 100.
-    fn fold_day(rec: &mut DailyRecord, day: u32, dip: f64) {
-        let mut s = crate::collect::BatterySample {
-            state_of_charge: Some(dip),
+    /// Fold one normal day: an unplugged session draining `top` → `bottom`
+    /// (≥ `MIN_DAY_SAMPLES` SoC samples, so the last sample reaches
+    /// `bottom` exactly), then a plugged-in stretch at 100.
+    fn fold_usage_day(rec: &mut DailyRecord, day: u32, top: f64, bottom: f64) {
+        for i in 0..MIN_DAY_SAMPLES {
+            let soc = top - (top - bottom) * i as f64 / (MIN_DAY_SAMPLES - 1) as f64;
+            rec.fold(&unplugged(soc), day);
+        }
+        let s = crate::collect::BatterySample {
+            state_of_charge: Some(100.0),
             ..Default::default()
         };
-        rec.fold(&s, day);
-        s.state_of_charge = Some(100.0);
         for _ in 0..MIN_DAY_SAMPLES {
             rec.fold(&s, day);
         }
@@ -236,7 +270,7 @@ mod tests {
     #[test]
     fn no_cap_options_hides_the_feature() {
         assert_eq!(
-            assess(&record_with_dips(10, 40.0), &CapOptions::none()),
+            assess(&record_with_usage(10, 80.0, 40.0), &CapOptions::none()),
             CapAssessment::Unsupported
         );
     }
@@ -244,7 +278,7 @@ mod tests {
     #[test]
     fn fewer_than_seven_qualified_days_never_recommends() {
         assert_eq!(
-            assess(&record_with_dips(6, 40.0), &MAC),
+            assess(&record_with_usage(6, 80.0, 40.0), &MAC),
             CapAssessment::NeedHistory { days: 6 }
         );
         // Thin days do not count toward the gate even in quantity.
@@ -255,30 +289,65 @@ mod tests {
     }
 
     #[test]
-    fn recommends_the_lowest_offered_level_that_covers_the_deepest_dip() {
-        // Deepest dip 62% → target 62 → macOS grid (80–100 step 5): the
-        // lowest covering level offered is 80.
-        let mut rec = record_with_dips(7, 62.0);
-        fold_day(&mut rec, 8, 64.0); // an 8th day, shallower — must not matter
+    fn recommends_the_lowest_offered_level_covering_usage_plus_reserve() {
+        // Deepest daily drain 80 → 60 (usage 20) → target 20 + 20 = 40 →
+        // macOS grid (80–100 step 5): the lowest covering level is 80.
+        let mut rec = record_with_usage(7, 80.0, 60.0);
+        fold_usage_day(&mut rec, 8, 75.0, 60.0); // an 8th day, shallower — must not matter
         assert_eq!(
             assess(&rec, &MAC),
             CapAssessment::Recommend(CapRecommendation {
                 level_pct: 80,
-                lowest_pct: 62.0,
+                usage_pct: 20.0,
                 days: 8
             })
         );
-        // ASUS fixed presets: dip 58 → 60.
+        // ASUS fixed presets: drain 78 → 40 (usage 38) → target 58 → 60.
         let asus = CapOptions {
             fixed: &[60, 80],
             range: None,
             adaptive: false,
         };
         assert_eq!(
-            assess(&record_with_dips(7, 58.0), &asus),
+            assess(&record_with_usage(7, 78.0, 40.0), &asus),
             CapAssessment::Recommend(CapRecommendation {
                 level_pct: 60,
-                lowest_pct: 58.0,
+                usage_pct: 38.0,
+                days: 7
+            })
+        );
+    }
+
+    /// Re-audit N1, the headline case: a user draining 100% → 8% daily is
+    /// NOT covered by any cap — usage 92 + 20 reserve = 112 exceeds every
+    /// level, so the feature says `NoFit` instead of endorsing a cap that
+    /// under-covers the day.
+    #[test]
+    fn deep_daily_usage_no_level_covers_degrades_to_no_fit() {
+        assert_eq!(
+            assess(&record_with_usage(7, 100.0, 8.0), &MAC),
+            CapAssessment::NoFit {
+                usage_pct: 92.0,
+                days: 7
+            }
+        );
+    }
+
+    /// The reserve leaves headroom over the drain: usage 40 + 20 = 60, so
+    /// the 50% preset — which the old dip-anchored rule would have picked —
+    /// must not be chosen.
+    #[test]
+    fn reserve_leaves_headroom_above_the_deepest_drain() {
+        let machine = CapOptions {
+            fixed: &[50, 60, 80],
+            range: None,
+            adaptive: false,
+        };
+        assert_eq!(
+            assess(&record_with_usage(7, 70.0, 30.0), &machine),
+            CapAssessment::Recommend(CapRecommendation {
+                level_pct: 60,
+                usage_pct: 40.0,
                 days: 7
             })
         );
@@ -286,8 +355,10 @@ mod tests {
 
     #[test]
     fn the_recommendation_never_sits_below_twenty_percent() {
-        // A recorded day ran to 8%: the floor governs, the recommendation
-        // stays at 20 where the machine offers it, never lower.
+        // A machine that never unplugs has zero recorded usage: the floor
+        // governs, the recommendation sits at 20 where the machine offers
+        // it, never lower — never at the parked charge (the old rule told
+        // such a user 100%).
         let sub_twenty = CapOptions {
             fixed: &[],
             range: Some(CapRange {
@@ -297,42 +368,31 @@ mod tests {
             }),
             adaptive: false,
         };
+        let mut rec = DailyRecord::default();
+        for day in 0..7u32 {
+            let s = crate::collect::BatterySample {
+                state_of_charge: Some(100.0),
+                ..Default::default()
+            };
+            for _ in 0..MIN_DAY_SAMPLES {
+                rec.fold(&s, day);
+            }
+        }
         assert_eq!(
-            assess(&record_with_dips(7, 8.0), &sub_twenty),
+            assess(&rec, &sub_twenty),
             CapAssessment::Recommend(CapRecommendation {
                 level_pct: 20,
-                lowest_pct: 8.0,
+                usage_pct: 0.0,
                 days: 7
             })
         );
     }
 
     #[test]
-    fn no_offered_level_that_covers_degrades_to_no_fit_not_a_guess() {
-        // Usage never dipped below 95% — an 80-max machine has no cap that
-        // covers it; the feature says so instead of recommending a level
-        // that under-covers the user.
-        assert_eq!(
-            assess(
-                &record_with_dips(7, 95.0),
-                &CapOptions {
-                    fixed: &[60, 80],
-                    range: None,
-                    adaptive: false,
-                }
-            ),
-            CapAssessment::NoFit {
-                lowest_pct: 95.0,
-                days: 7
-            }
-        );
-    }
-
-    #[test]
     fn days_without_state_of_charge_never_contribute() {
-        let mut rec = record_with_dips(7, 50.0);
+        let mut rec = record_with_usage(7, 80.0, 50.0);
         // An eighth day of pure no-SoC samples: counted neither as history
-        // nor as a dip.
+        // nor as usage.
         let mut blank = crate::collect::BatterySample::default();
         for _ in 0..(MIN_DAY_SAMPLES + 1) {
             rec.fold(&blank, 8);
@@ -343,7 +403,7 @@ mod tests {
             assess(&rec, &MAC),
             CapAssessment::Recommend(CapRecommendation {
                 level_pct: 80,
-                lowest_pct: 50.0,
+                usage_pct: 30.0,
                 days: 7
             })
         );

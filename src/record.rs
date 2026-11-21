@@ -5,8 +5,8 @@
 //! 1-minute history (`history.rs`) expires after 7 days, this store is what
 //! can show capacity fade a year later.
 //!
-//! Bounded by construction: a row is a fixed 7-number JSON array
-//! (~55 bytes), so a year of daily rows is roughly 20 KB; a generous hard
+//! Bounded by construction: a row is a fixed-width number JSON array
+//! (~80 bytes), so a year of daily rows is roughly 30 KB; a generous hard
 //! cap ([`MAX_DAYS`]) keeps the file small even after a decade of use.
 //!
 //! Persistence mirrors `history.rs`: a single versioned JSON file in the
@@ -22,14 +22,17 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::collect::types::{state_of_health_pct, BatterySample};
+use crate::collect::types::{state_of_health_pct, BatterySample, ChargingState};
 use crate::history::LoadError;
 
-/// A sample counts as "at high charge" at this state of charge or above —
-/// the top of the longevity band the scorecard and coaching use (80%).
-/// Re-exported, not re-declared: the daily record must track the H4 dwell
-/// convention by construction, never by a copied constant.
-pub use crate::dwell::DWELL_SOC_PCT as HIGH_CHARGE_SOC_PCT;
+/// A sample counts as "at high charge" only when it sits meaningfully above
+/// the top of the longevity band — the dwell convention's threshold
+/// (80% + hysteresis margin, re-audit N3), so a machine correctly holding
+/// exactly AT its 80% cap accrues no high-charge time, in the daily record
+/// just as in the live dwell total. Re-exported, not re-declared: the daily
+/// record must track the H4 dwell convention by construction, never by a
+/// copied constant.
+pub use crate::dwell::dwell_threshold as high_charge_threshold;
 /// A sample counts as a warm hour at this pack temperature or above
 /// (degrees Celsius) — the same "warm" floor FR-4 counts weekly.
 pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
@@ -40,10 +43,12 @@ pub use crate::warm::WARM_THRESHOLD_C as WARM_TEMP_C;
 pub const MAX_DAYS: usize = 10 * 366;
 
 /// On-disk schema version. A mismatch is treated as a corrupt file.
-/// Version 2 adds per-day state-of-charge tracking (`soc_n`, `soc_min`) for
-/// FR-2; version 1 rows (7 fields) still parse, with the SoC fields absent —
-/// those days contribute no minimum rather than a guessed one.
-const SCHEMA_VERSION: f64 = 2.0;
+/// Version 3 adds per-day unplugged-discharge tracking (`disch_n`,
+/// `disch_min`, `disch_max`) for FR-2's usage-based cap recommendation
+/// (re-audit N1); version 2 rows (9 fields) still parse with those fields
+/// absent, and version 1 rows (7 fields) with the SoC fields absent too —
+/// those days contribute no discharge range rather than a guessed one.
+const SCHEMA_VERSION: f64 = 3.0;
 
 /// One day's summary. Sums + counts per metric so a partially-populated
 /// day (missing temperature on Windows, say) never poisons the mean.
@@ -57,7 +62,8 @@ pub struct DailyRow {
     pub soh_n: u32,
     /// Last cycle count seen that day (cumulative counter, not a mean).
     pub cycles_last: Option<u32>,
-    /// Samples at or above `HIGH_CHARGE_SOC_PCT`.
+    /// Samples meaningfully above the high-charge threshold
+    /// (`high_charge_threshold()` — the dwell convention).
     pub high_n: u32,
     /// Samples at or above `WARM_TEMP_C`.
     pub warm_n: u32,
@@ -67,6 +73,15 @@ pub struct DailyRow {
     /// Lowest state of charge observed that day, percent. `None` when no
     /// sample carried a state of charge.
     pub soc_min: Option<f64>,
+    /// Samples observed while unplugged (discharging) that carried a state
+    /// of charge — the quality gate for the day's discharge range.
+    pub disch_n: u32,
+    /// Lowest state of charge observed while unplugged that day, percent.
+    /// `None` when no unplugged sample carried a state of charge.
+    pub disch_min: Option<f64>,
+    /// Highest state of charge observed while unplugged that day, percent.
+    /// `None` when no unplugged sample carried a state of charge.
+    pub disch_max: Option<f64>,
 }
 
 impl DailyRow {
@@ -81,6 +96,9 @@ impl DailyRow {
             warm_n: 0,
             soc_n: 0,
             soc_min: None,
+            disch_n: 0,
+            disch_min: None,
+            disch_max: None,
         }
     }
 
@@ -152,6 +170,16 @@ impl DailyRecord {
             // high (a lower minimum means a higher covering cap) — the
             // safe direction, at the cost of some savings.
             row.soc_min = Some(row.soc_min.map_or(v, |m: f64| m.min(v)));
+            // Re-audit N1: the day's unplugged discharge range — the raw
+            // material of "how deep does this user actually drain". Only
+            // discharging samples count: a machine parked at 100% on AC
+            // never drains, and that must read as zero usage, not as the
+            // parked level.
+            if s.charging_state == Some(ChargingState::Discharging) {
+                row.disch_n += 1;
+                row.disch_min = Some(row.disch_min.map_or(v, |m: f64| m.min(v)));
+                row.disch_max = Some(row.disch_max.map_or(v, |m: f64| m.max(v)));
+            }
         }
         if let Some(v) = state_of_health_pct(s) {
             row.soh_sum += v;
@@ -161,7 +189,7 @@ impl DailyRecord {
             row.cycles_last = Some(c);
         }
         if s.state_of_charge
-            .is_some_and(|soc| soc >= HIGH_CHARGE_SOC_PCT)
+            .is_some_and(|soc| soc >= high_charge_threshold())
         {
             row.high_n += 1;
         }
@@ -202,19 +230,19 @@ impl DailyRecord {
         added
     }
 
-    /// Serialize to the on-disk JSON schema (v2):
-    /// `{"version":2,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min],...]}`
-    /// (cycles and soc_min are NaN when unknown). Rust's f64 Display
-    /// round-trips.
+    /// Serialize to the on-disk JSON schema (v3):
+    /// `{"version":3,"rows":[[day,n,soh_sum,soh_n,cycles,high_n,warm_n,soc_n,soc_min,disch_n,disch_min,disch_max],...]}`
+    /// (cycles, soc_min and the discharge bounds are NaN when unknown).
+    /// Rust's f64 Display round-trips.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(90 * self.rows.len() + 32);
-        out.push_str("{\"version\":2,\"rows\":[");
+        let mut out = String::with_capacity(110 * self.rows.len() + 32);
+        out.push_str("{\"version\":3,\"rows\":[");
         for (i, r) in self.rows.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push_str(&format!(
-                "[{},{},{},{},{},{},{},{},{}]",
+                "[{},{},{},{},{},{},{},{},{},{},{},{}]",
                 r.day,
                 r.n,
                 r.soh_sum,
@@ -224,6 +252,9 @@ impl DailyRecord {
                 r.warm_n,
                 r.soc_n,
                 r.soc_min.unwrap_or(f64::NAN),
+                r.disch_n,
+                r.disch_min.unwrap_or(f64::NAN),
+                r.disch_max.unwrap_or(f64::NAN),
             ));
         }
         out.push_str("]}");
@@ -239,11 +270,16 @@ impl DailyRecord {
         p.expect(b'{')?;
         p.expect_key("version")?;
         let version = p.number()?;
-        if version != SCHEMA_VERSION && version != 1.0 {
+        if !(1.0..=SCHEMA_VERSION).contains(&version) {
             return Err(format!("unsupported schema version {version}"));
         }
-        // Version 1 rows carry 7 fields (no SoC tracking); version 2, 9.
-        let arity = if version == 1.0 { 7 } else { 9 };
+        // Version 1 rows carry 7 fields (no SoC tracking); version 2, 9;
+        // version 3, 12 (adds the unplugged discharge range).
+        let arity = match version {
+            1.0 => 7,
+            2.0 => 9,
+            _ => 12,
+        };
         p.skip_ws();
         p.expect(b',')?;
         p.expect_key("rows")?;
@@ -264,7 +300,7 @@ impl DailyRecord {
             if !cycles.is_nan() && (cycles < 0.0 || cycles.fract() != 0.0) {
                 return Err(format!("invalid cycle count {cycles}"));
             }
-            let soc_min = if arity == 9 {
+            let soc_min = if arity >= 9 {
                 let v = f[8];
                 if v.is_nan() {
                     None
@@ -276,6 +312,21 @@ impl DailyRecord {
             } else {
                 // A v1 day observed no SoC tracking: no minimum, never a guess.
                 None
+            };
+            // v3: the unplugged discharge range. Older versions observed no
+            // discharge tracking — no range, never a guess.
+            let pct = |i: usize| -> Result<Option<f64>, String> {
+                if arity < 12 {
+                    return Ok(None);
+                }
+                let v = f[i];
+                if v.is_nan() {
+                    Ok(None)
+                } else if !(0.0..=100.0).contains(&v) {
+                    Err(format!("invalid state of charge {v}"))
+                } else {
+                    Ok(Some(v))
+                }
             };
             rows.push(DailyRow {
                 day: f[0] as u32,
@@ -289,8 +340,11 @@ impl DailyRecord {
                 },
                 high_n: f[5] as u32,
                 warm_n: f[6] as u32,
-                soc_n: if arity == 9 { f[7] as u32 } else { 0 },
+                soc_n: if arity >= 9 { f[7] as u32 } else { 0 },
                 soc_min,
+                disch_n: if arity == 12 { f[9] as u32 } else { 0 },
+                disch_min: pct(10)?,
+                disch_max: pct(11)?,
             });
             p.skip_ws();
             if !p.eat(b',') {
@@ -414,6 +468,59 @@ mod tests {
         assert_eq!(round.rows[0].soc_n, 2);
     }
 
+    /// A sample observed while unplugged (discharging).
+    fn unplugged(soc: f64) -> BatterySample {
+        BatterySample {
+            state_of_charge: Some(soc),
+            charging_state: Some(crate::collect::types::ChargingState::Discharging),
+            ..Default::default()
+        }
+    }
+
+    /// Re-audit N1: the day's unplugged discharge range. A plugged-in day
+    /// parked at 100% records no range at all — parked is not usage.
+    #[test]
+    fn fold_tracks_the_unplugged_discharge_range() {
+        let mut rec = DailyRecord::default();
+        rec.fold(&unplugged(70.0), 3);
+        rec.fold(&unplugged(30.0), 3);
+        rec.fold(&unplugged(55.0), 3);
+        // Plugged samples never contribute to the unplugged range.
+        rec.fold(&sample(100.0, None), 3);
+        let r = rec.rows[0];
+        assert_eq!(r.disch_n, 3);
+        assert_eq!(r.disch_min, Some(30.0));
+        assert_eq!(r.disch_max, Some(70.0));
+
+        // A machine that never unplugs: no range, never a guessed one.
+        let mut rec = DailyRecord::default();
+        rec.fold(&sample(100.0, None), 3);
+        let r = rec.rows[0];
+        assert_eq!(r.disch_n, 0);
+        assert_eq!(r.disch_min, None);
+        assert_eq!(r.disch_max, None);
+    }
+
+    /// A v2 file (pre-N1 schema) parses with no discharge range rather than
+    /// a guessed one; a v3 round trip preserves the range exactly.
+    #[test]
+    fn v2_parses_without_discharge_range_v3_round_trips_it() {
+        let v2 = "{\"version\":2,\"rows\":[[3,2,180.0,2,120,1,0,2,41.5]]}";
+        let rec = DailyRecord::from_json(v2).expect("v2 parses");
+        assert_eq!(rec.rows[0].soc_min, Some(41.5));
+        assert_eq!(rec.rows[0].disch_n, 0);
+        assert_eq!(rec.rows[0].disch_min, None);
+        assert_eq!(rec.rows[0].disch_max, None);
+
+        let mut rec = DailyRecord::default();
+        rec.fold(&unplugged(80.0), 3);
+        rec.fold(&unplugged(22.5), 3);
+        let round = DailyRecord::from_json(&rec.to_json()).expect("v3 parse");
+        assert_eq!(round.rows[0].disch_n, 2);
+        assert_eq!(round.rows[0].disch_min, Some(22.5));
+        assert_eq!(round.rows[0].disch_max, Some(80.0));
+    }
+
     #[test]
     fn same_day_samples_fold_into_one_row() {
         let mut rec = DailyRecord::default();
@@ -440,7 +547,7 @@ mod tests {
         assert!((r.warm_hours() - 2.0 / 3600.0).abs() < 1e-12);
         // Exactly on the thresholds counts as in.
         let mut rec = DailyRecord::default();
-        rec.fold(&sample(HIGH_CHARGE_SOC_PCT, Some(WARM_TEMP_C)), 7);
+        rec.fold(&sample(high_charge_threshold(), Some(WARM_TEMP_C)), 7);
         assert_eq!(rec.rows[0].high_n, 1);
         assert_eq!(rec.rows[0].warm_n, 1);
     }

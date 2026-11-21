@@ -56,9 +56,7 @@ fn clamp100(v: f64) -> f64 {
 /// data-mapping — no platform-specific logic here.
 fn capacity_source_note(source: SourceKind) -> &'static str {
     match source {
-        SourceKind::MacIoreg => {
-            "raw firmware gauge (ioreg); the macOS Settings figure can differ"
-        }
+        SourceKind::MacIoreg => "raw firmware gauge (ioreg); the macOS Settings figure can differ",
         SourceKind::MacSystemProfiler => "firmware figures via system_profiler",
         SourceKind::WindowsWmi => "firmware figures via WMI (Win32_Battery)",
         SourceKind::WindowsPowerStatus => "Windows power-status figures",
@@ -120,21 +118,22 @@ fn score_soc_band(s: &BatterySample) -> Option<ParameterScore> {
     })
 }
 
-/// High-SoC dwell: accumulated time at or above the 80% threshold while
-/// plugged in (tracked by the app from the sample stream, audit H4), decayed;
-/// unknown when never tracked.
+/// High-SoC dwell: accumulated time meaningfully above the longevity-band
+/// top while plugged in (tracked by the app from the sample stream, audit
+/// H4; re-audit N3 caps it at the cap behaviour itself), decayed; unknown
+/// when never tracked.
 fn score_high_dwell(s: &BatterySample) -> Option<ParameterScore> {
     let dwell_s = s.high_soc_dwell_s?;
-    // 0 s → 100; every 30 min at or above the threshold costs ~8 points,
+    // 0 s → 100; every 30 min above the threshold costs ~8 points,
     // floor at 20.
     let score = clamp100(100.0 - (dwell_s / 1800.0) * 8.0).max(20.0);
     let detail = if dwell_s < 60.0 {
         "Not parked at high charge".to_string()
     } else {
         format!(
-            "{:.0} min at or above {:.0}% charge",
+            "{:.0} min above {:.0}% charge",
             dwell_s / 60.0,
-            crate::dwell::DWELL_SOC_PCT
+            crate::dwell::dwell_threshold()
         )
     };
     Some(ParameterScore {
@@ -259,7 +258,11 @@ mod tests {
         let hot = evaluate(&s);
         let base = evaluate(&full_sample());
         assert!(hot.total < base.total);
-        let thermal = hot.parameters.iter().find(|p| p.name == "Temperature").unwrap();
+        let thermal = hot
+            .parameters
+            .iter()
+            .find(|p| p.name == "Temperature")
+            .unwrap();
         assert!(thermal.score < 40.0, "thermal score {}", thermal.score);
     }
 
@@ -285,7 +288,11 @@ mod tests {
         s.charging_state = Some(ChargingState::Charging);
         s.power_w = Some(-24.0); // fast charge
         let r2 = evaluate(&s);
-        let rate = r2.parameters.iter().find(|p| p.name == "Charge rate").unwrap();
+        let rate = r2
+            .parameters
+            .iter()
+            .find(|p| p.name == "Charge rate")
+            .unwrap();
         assert!(rate.score < 100.0);
     }
 
@@ -324,7 +331,11 @@ mod tests {
         let mut s = full_sample();
         s.state_of_charge = Some(5.0);
         let r = evaluate(&s);
-        let band = r.parameters.iter().find(|p| p.name == "Charge band").unwrap();
+        let band = r
+            .parameters
+            .iter()
+            .find(|p| p.name == "Charge band")
+            .unwrap();
         assert!(band.score < 50.0);
     }
 
