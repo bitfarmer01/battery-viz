@@ -138,6 +138,10 @@ pub struct App {
     /// The stretch state as last written to disk, so checkpointing can tell
     /// "unchanged since the last persist" from "time to persist again".
     cap_stretch_persisted: Option<capdetect::StretchState>,
+    /// FR-3: the settled cap verdict as last written to disk. A transition
+    /// (cap detected or gone) persists immediately, so charge-alert
+    /// retirement survives a restart instead of re-detecting for 3 h.
+    cap_verdict_persisted: Option<capdetect::CapStatus>,
     /// FR-0 adapter for this machine: detectability, guidance, maker.
     /// Feature code asks it, never the OS directly.
     capabilities: Box<dyn Capabilities>,
@@ -335,10 +339,16 @@ impl App {
         let mut cap_monitor = CapMonitor::for_adapter(capabilities.as_ref());
         // Resume a detection stretch from a previous session, so a capped
         // machine can resolve across restarts instead of starting over.
+        // FR-3: a settled verdict resumes first — retirement must hold from
+        // the first tick, not after a 3 h re-detection.
         let cap_stretch_persisted = cap_prompt_record.stretch;
+        if let Some(verdict) = cap_prompt_record.verdict {
+            cap_monitor.restore_verdict(verdict);
+        }
         if let Some(stretch) = cap_prompt_record.stretch {
             cap_monitor.restore_stretch(stretch, crate::history::unix_now());
         }
+        let cap_verdict_persisted = cap_prompt_record.verdict;
         let mut app = App {
             rx,
             latest: None,
@@ -387,6 +397,7 @@ impl App {
             cap_prompt_path,
             cap_setup_load_error,
             cap_stretch_persisted,
+            cap_verdict_persisted,
             capabilities,
             #[cfg(test)]
             test_clock: None,
@@ -472,7 +483,7 @@ impl App {
             self.dwell_prev_s = Some(now_s);
             self.record_daily(sample);
             self.cap_monitor.observe(sample, crate::history::unix_now());
-            self.checkpoint_cap_stretch();
+            self.checkpoint_cap_state();
             self.observe_alert_outcomes(sample);
             self.tick_alerts(sample);
         }
@@ -529,11 +540,16 @@ impl App {
 
     /// Advance the alert engine by one sample and deliver a nudge when it
     /// fires. Pausing resets the engine: sustain windows from before the
-    /// pause cannot fire stale alerts on resume.
+    /// pause cannot fire stale alerts on resume. FR-3: the charge coaches
+    /// are gated on the live cap verdict every tick — a detected cap
+    /// retires DwellCoach/BandCoach, a disappeared cap re-arms them.
     fn tick_alerts(&mut self, sample: &crate::collect::BatterySample) {
         if self.alerts_paused {
             return;
         }
+        let charge_coaching = self.alert_engine_charge_coaching_enabled();
+        self.alert_engine
+            .set_charge_coaching_enabled(charge_coaching);
         let local = self.local_clock();
         let tick = ClockInput {
             now_s: self.start.elapsed().as_secs_f64(),
@@ -556,11 +572,22 @@ impl App {
 
     /// Pause/unpause coaching nudges. Resetting the engine means a pause of
     /// any length never surfaces a backlog of stale conditions on resume.
+    /// The FR-3 charge-cap gate survives the reset: it is state about the
+    /// machine, not about the pause.
     pub fn set_alerts_paused(&mut self, paused: bool) {
         if self.alerts_paused != paused {
             self.alerts_paused = paused;
+            let charge_coaching = self.alert_engine_charge_coaching_enabled();
             self.alert_engine = AlertEngine::new();
+            self.alert_engine
+                .set_charge_coaching_enabled(charge_coaching);
         }
+    }
+
+    /// Current FR-3 gate of the engine (kept beside the reset above so the
+    /// machine-level gate outlives an engine reset).
+    fn alert_engine_charge_coaching_enabled(&self) -> bool {
+        !matches!(self.cap_monitor.status(), capdetect::CapStatus::Capped)
     }
 
     /// Open the in-app confirm panel. No deletion happens here.
@@ -624,12 +651,13 @@ impl App {
         }
     }
 
-    /// FR-1: keep the detection stretch on disk — at most one write per
-    /// [`capdetect::STRETCH_PERSIST_SECS`] per stretch, plus one write when a
-    /// stretch breaks — so a restart resumes a running detection instead of
-    /// resetting it and a capped machine can resolve across sessions.
-    /// Failures surface in the header, never silent.
-    fn checkpoint_cap_stretch(&mut self) {
+    /// FR-1/FR-3: keep the charge-cap state on disk — a verdict transition
+    /// (cap detected or gone) writes immediately, so charge-alert retirement
+    /// survives a restart; a running stretch writes at most once per
+    /// [`capdetect::STRETCH_PERSIST_SECS`], plus once when it breaks — so a
+    /// restart resumes a running detection instead of resetting it. Failures
+    /// surface in the header, never silent.
+    fn checkpoint_cap_state(&mut self) {
         let stretch = self
             .cap_monitor
             .stretch_state()
@@ -638,6 +666,16 @@ impl App {
                 last_seen,
                 max_soc,
             });
+        // FR-3: a verdict transition persists before anything else — the
+        // retirement gate must be on disk by the time the next launch reads.
+        let verdict = settled_verdict(self.cap_monitor.status());
+        if verdict != self.cap_verdict_persisted {
+            if self.persist_cap_record(stretch) {
+                self.cap_verdict_persisted = verdict;
+                self.cap_stretch_persisted = stretch;
+            }
+            return;
+        }
         match (stretch, self.cap_stretch_persisted) {
             (Some(s), last) => {
                 let due = last.is_none_or(|prev| {
@@ -660,10 +698,12 @@ impl App {
     }
 
     /// Write the cap-setup record as it currently stands, optionally carrying
-    /// a stretch. Returns whether the write landed.
+    /// a stretch. The live verdict rides along (FR-3). Returns whether the
+    /// write landed.
     fn persist_cap_record(&mut self, stretch: Option<capdetect::StretchState>) -> bool {
         let mut record = self.cap_prompt_record;
         record.stretch = stretch;
+        record.verdict = settled_verdict(self.cap_monitor.status());
         match self.cap_prompt_path.as_deref().map(|p| capdetect::save_record(p, record)) {
             Some(Ok(())) | None => true,
             Some(Err(e)) => {
@@ -803,6 +843,15 @@ impl App {
     }
 }
 
+/// FR-3: a monitor status is a persisted verdict only when settled —
+/// `Capped` or `Uncapped`. `Undetermined` and `Hidden` never persist.
+fn settled_verdict(status: capdetect::CapStatus) -> Option<capdetect::CapStatus> {
+    match status {
+        capdetect::CapStatus::Capped | capdetect::CapStatus::Uncapped => Some(status),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +890,58 @@ mod tests {
             charging_state: Some(crate::collect::types::ChargingState::Charging),
             ..Default::default()
         }
+    }
+
+    fn sample_on_ac_parked() -> crate::collect::BatterySample {
+        crate::collect::BatterySample {
+            state_of_charge: Some(80.0),
+            charging_state: Some(crate::collect::types::ChargingState::OnAcNotCharging),
+            ..Default::default()
+        }
+    }
+
+    /// FR-3: a settled Capped verdict persists and reloads, so charge-alert
+    /// retirement holds from the first tick after a restart — no 3 h
+    /// re-detection window of nagging a capped machine.
+    #[test]
+    fn fr3_capped_verdict_persists_and_retires_charge_alerts_after_restart() {
+        let dir = tagged_dir("fr3-verdict");
+        let history = dir.join("history.json");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::with_history_path(rx, Some(history.clone()));
+        assert!(!app.cap_prompt_visible(), "no prompt before any evidence");
+
+        // Drive the monitor to a Capped verdict (injected clock, pure).
+        let base = crate::history::unix_now();
+        let mut now = base;
+        while now <= base + capdetect::CAP_SUSTAIN_SECS {
+            app.cap_monitor.observe(&sample_on_ac_parked(), now);
+            now += 60;
+        }
+        assert_eq!(app.cap_monitor.status(), capdetect::CapStatus::Capped);
+        app.checkpoint_cap_state();
+        let record_text = std::fs::read_to_string(app.cap_prompt_path.clone().unwrap())
+            .expect("cap record written");
+        assert!(
+            record_text.contains("status capped"),
+            "verdict must be on disk: {record_text:?}"
+        );
+
+        // A restart resumes the verdict: the gate is off from the first
+        // tick, and the one-time prompt still does not show.
+        let (tx2, rx2) = crossbeam_channel::unbounded();
+        let mut reloaded = App::with_history_path(rx2, Some(history.clone()));
+        assert_eq!(reloaded.cap_monitor.status(), capdetect::CapStatus::Capped);
+        assert!(!reloaded.alert_engine_charge_coaching_enabled());
+        assert!(!reloaded.cap_prompt_visible());
+
+        // Feeding the reloaded app a parked-at-100 sample fires no alert.
+        tx2.send(Ok(sample_charging(100.0))).unwrap();
+        tx2.send(Ok(sample_on_ac_parked())).unwrap();
+        reloaded.update();
+        assert!(reloaded.last_alert.is_none(), "retired coaches stay quiet");
+        drop(tx);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
