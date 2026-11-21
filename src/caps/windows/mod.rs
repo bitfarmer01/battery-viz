@@ -204,10 +204,14 @@ pub fn parse_battery_report(html: &str) -> Vec<SeedCapacity> {
             (Some(f), Some(d)) if f > day_idx && d > day_idx => {
                 (parse_capacity(&cells[f]), parse_capacity(&cells[d]))
             }
-            // No header seen: first two numeric cells after the date.
+            // No header seen: the first two unit-bearing cells after the
+            // date. Real report figures carry the mWh unit; requiring it
+            // keeps digit-bearing noise cells (charge percentages, cycle
+            // counts) from being read as capacity figures (review L2).
             _ => {
                 let nums: Vec<f64> = cells[day_idx + 1..]
                     .iter()
+                    .filter(|c| c.to_lowercase().contains("mwh"))
                     .filter_map(|c| parse_capacity(c))
                     .collect();
                 if nums.len() < 2 {
@@ -276,17 +280,20 @@ fn parse_report_date(s: &str) -> Option<u32> {
 }
 
 /// Parse a capacity figure: integer mWh with a locale-dependent thousands
-/// separator (`,` US, `.` de, space/nbsp fr, `'` ch) and an optional
-/// `mWh` suffix. Digits survive; everything else is separator or noise —
-/// a cell that is not a figure parses to `None` and the row is skipped.
+/// separator (`,` US, `.` de, space/nbsp fr, `'` ch) and an optional,
+/// case-insensitive `mWh` suffix. Digits survive; everything else is
+/// separator or noise — a cell that is not a figure parses to `None` and
+/// the row is skipped.
 fn parse_capacity(s: &str) -> Option<f64> {
-    let digits: String = s
-        .trim()
-        .trim_end_matches("mWh")
-        .trim()
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let trimmed = s.trim();
+    // The unit is ASCII (mWh/mwh/MWh/...), so a lowercased tail ending in
+    // "mwh" guarantees the last three chars are ASCII and safe to slice.
+    let bare = if trimmed.len() >= 3 && trimmed.to_lowercase().ends_with("mwh") {
+        trimmed[..trimmed.len() - 3].trim()
+    } else {
+        trimmed
+    };
+    let digits: String = bare.chars().filter(|c| c.is_ascii_digit()).collect();
     digits.parse::<f64>().ok()
 }
 
@@ -436,6 +443,30 @@ mod tests {
     fn battery_report_without_capacity_history_seeds_nothing() {
         assert!(parse_battery_report("<html>no report here</html>").is_empty());
         assert!(parse_battery_report("").is_empty());
+    }
+
+    // Review L2: with no recognizable header, the fallback must read only
+    // unit-bearing cells. A charge percentage or cycle count is numeric but
+    // NOT a capacity figure — the old fallback read those first and could
+    // mint a wrong-figure seed.
+    #[test]
+    fn headerless_rows_ignore_digit_bearing_noise_cells() {
+        let html = "<html><body><h2>Battery capacity history</h2><table>\
+                    <tr><td>2019-09-16</td><td>65%</td><td>230 cycles</td>\
+                    <td>35.452 mWh</td><td>38.152 mWh</td></tr>\
+                    <tr><td>2019-09-17</td><td>30 mwh</td><td>40 MWH</td></tr>\
+                    </table></body></html>";
+        let seeds = parse_battery_report(html);
+        assert_eq!(seeds.len(), 2, "noise digits skipped, figures read");
+        assert!((seeds[0].soh_pct - 100.0 * 35_452.0 / 38_152.0).abs() < 1e-9);
+        assert!(
+            (seeds[0].soh_pct - 100.0 * 65.0 / 230.0).abs() > 1.0,
+            "the percentage/cycle digits must not become the figures"
+        );
+        assert!(
+            (seeds[1].soh_pct - 100.0 * 30.0 / 40.0).abs() < 1e-9,
+            "unit suffix case-insensitive"
+        );
     }
 
     // N11c: the shapes a REAL report has (verified against a captured
